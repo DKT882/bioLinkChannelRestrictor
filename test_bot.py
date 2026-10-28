@@ -9,6 +9,7 @@ from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 
 from main import (
     BIO_LINK_REGEX,
+    contains_link_or_handle,
     active_groups,
     username_to_id,
     admin_cache,
@@ -53,6 +54,14 @@ class TestBioRegex(unittest.TestCase):
             with self.subTest(bio=bio):
                 matched = bool(BIO_LINK_REGEX.search(bio))
                 self.assertFalse(matched, f"False positive for bio: {bio}")
+
+    def test_contains_link_or_handle_helper(self):
+        self.assertTrue(contains_link_or_handle("Visit https://example.com"))
+        self.assertTrue(contains_link_or_handle("Telegram @mychan"))
+        self.assertTrue(contains_link_or_handle("Bio link bio.link/xyz"))
+        self.assertFalse(contains_link_or_handle("Just a normal text"))
+        self.assertFalse(contains_link_or_handle(""))
+        self.assertFalse(contains_link_or_handle(None))
 
 class TestStateManagement(unittest.TestCase):
     def setUp(self):
