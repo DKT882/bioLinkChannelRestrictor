@@ -35,6 +35,11 @@ import telebot
 from telebot.async_telebot import AsyncTeleBot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
+try:
+    from telebot.asyncio_helper import ApiTelegramException as AsyncApiTelegramException
+    TELEGRAM_EXCEPTIONS = (ApiTelegramException, AsyncApiTelegramException)
+except ImportError:
+    TELEGRAM_EXCEPTIONS = (ApiTelegramException,)
 
 from database import db_manager
 
@@ -246,7 +251,7 @@ async def is_user_admin(chat_id: int, user_id: int, message: Optional[types.Mess
         if not future.done():
             future.set_result(admin_ids)
         return user_id in admin_ids
-    except ApiTelegramException as e:
+    except TELEGRAM_EXCEPTIONS as e:
         if not future.done():
             future.set_exception(e)
         logger.error(f"Error fetching administrators for chat {chat_id}: {e}")
@@ -362,10 +367,11 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
             future.set_result((False, ""))
         return False, ""
 
-    except ApiTelegramException as e:
+    except TELEGRAM_EXCEPTIONS as e:
         if not future.done():
             future.set_result((False, ""))
-        if e.error_code == 429:
+        err_code = getattr(e, "error_code", None)
+        if err_code == 429:
             retry_after = getattr(e, "result_json", {}).get("parameters", {}).get("retry_after", 5)
             logger.warning(f"Telegram FloodWait encountered for user {user_id}. Backing off for {retry_after}s.")
             bio_cache[user_id] = (False, "", now + float(retry_after))
@@ -411,7 +417,7 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
     # Step 1: Always delete the violating message
     try:
         await bot.delete_message(chat_id, message.message_id)
-    except ApiTelegramException as e:
+    except TELEGRAM_EXCEPTIONS as e:
         logger.warning(f"Could not delete message {message.message_id} in chat {chat_id}: {e}")
 
     # Record to MongoDB audit trail asynchronously
@@ -469,7 +475,7 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
             ban_msg = await bot.send_message(chat_id, ban_text, parse_mode="HTML")
             asyncio.create_task(auto_delete_message(chat_id, ban_msg.message_id, 30))
 
-    except ApiTelegramException as e:
+    except TELEGRAM_EXCEPTIONS as e:
         logger.error(f"Failed to execute action '{action}' on user {user.id} in chat {chat_id}: {e}")
         if "not enough rights" in str(e).lower() or "admin" in str(e).lower():
             try:
@@ -1329,14 +1335,15 @@ async def main():
                     allowed_updates=["message", "edited_message"]
                 )
                 break
-            except ApiTelegramException as e:
-                if e.error_code == 409:
-                    logger.warning(
-                        "Telegram Conflict (409): Another bot instance or previous Render container is still shutting down. "
-                        "Waiting 5 seconds before retrying..."
+            except TELEGRAM_EXCEPTIONS as e:
+                err_code = getattr(e, "error_code", None)
+                if err_code == 409 or "409" in str(e) or "Conflict" in str(e):
+                    logger.info(
+                        "Deploy handoff in progress: Previous Render container is shutting down (Telegram 409). "
+                        "Waiting 5 seconds to take over polling..."
                     )
                     await asyncio.sleep(5)
-                elif e.error_code == 429:
+                elif err_code == 429 or "429" in str(e):
                     retry_after = getattr(e, "result_json", {}).get("parameters", {}).get("retry_after", 10)
                     logger.warning(f"Telegram FloodWait (429): Backing off for {retry_after}s...")
                     await asyncio.sleep(float(retry_after))
@@ -1346,8 +1353,15 @@ async def main():
             except (asyncio.CancelledError, KeyboardInterrupt):
                 raise
             except Exception as e:
-                logger.error(f"Unexpected polling error: {e}. Retrying in 5s...")
-                await asyncio.sleep(5)
+                if "409" in str(e) or "Conflict" in str(e):
+                    logger.info(
+                        "Deploy handoff in progress: Previous Render container is shutting down (Telegram 409). "
+                        "Waiting 5 seconds to take over polling..."
+                    )
+                    await asyncio.sleep(5)
+                else:
+                    logger.error(f"Unexpected polling error: {e}. Retrying in 5s...")
+                    await asyncio.sleep(5)
 
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Shutdown signal received.")
