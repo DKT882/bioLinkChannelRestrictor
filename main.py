@@ -1311,15 +1311,43 @@ async def main():
         # Register scoped bot commands in Telegram catalog (Admins only for groups)
         await register_bot_commands()
 
-        logger.info("Starting Telegram Bot non-blocking infinity polling...")
+        # Clear any stale webhook that could cause conflict with getUpdates polling
+        try:
+            await bot.delete_webhook(drop_pending_updates=True)
+            logger.info("Cleared stale webhooks.")
+        except Exception as e:
+            logger.warning(f"Notice on delete_webhook: {e}")
 
-        # Start non-blocking infinity polling with resilient timeouts
-        await bot.infinity_polling(
-            skip_pending=True,
-            timeout=20,
-            request_timeout=25,
-            allowed_updates=["message", "edited_message"]
-        )
+        # Resilient polling loop: handles 409 Conflict gracefully (e.g. during Render rolling deployments)
+        while True:
+            try:
+                logger.info("Starting Telegram Bot non-blocking infinity polling...")
+                await bot.infinity_polling(
+                    skip_pending=True,
+                    timeout=20,
+                    request_timeout=25,
+                    allowed_updates=["message", "edited_message"]
+                )
+                break
+            except ApiTelegramException as e:
+                if e.error_code == 409:
+                    logger.warning(
+                        "Telegram Conflict (409): Another bot instance or previous Render container is still shutting down. "
+                        "Waiting 5 seconds before retrying..."
+                    )
+                    await asyncio.sleep(5)
+                elif e.error_code == 429:
+                    retry_after = getattr(e, "result_json", {}).get("parameters", {}).get("retry_after", 10)
+                    logger.warning(f"Telegram FloodWait (429): Backing off for {retry_after}s...")
+                    await asyncio.sleep(float(retry_after))
+                else:
+                    logger.error(f"Telegram API Exception during polling: {e}. Retrying in 5s...")
+                    await asyncio.sleep(5)
+            except (asyncio.CancelledError, KeyboardInterrupt):
+                raise
+            except Exception as e:
+                logger.error(f"Unexpected polling error: {e}. Retrying in 5s...")
+                await asyncio.sleep(5)
 
     except (asyncio.CancelledError, KeyboardInterrupt):
         logger.info("Shutdown signal received.")
