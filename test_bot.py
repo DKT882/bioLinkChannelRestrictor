@@ -144,5 +144,16 @@ class TestHttpServer(AioHTTPTestCase):
         self.assertIn("Active Groups", text)
 
 
+from database import db_manager
+
+class TestDatabaseManager(unittest.IsolatedAsyncioTestCase):
+    async def test_fallback_when_no_uri(self):
+        connected = await db_manager.connect(None)
+        self.assertFalse(connected)
+        self.assertFalse(db_manager.is_connected)
+        metrics = await db_manager.get_metrics()
+        self.assertFalse(metrics["connected"])
+
+
 if __name__ == "__main__":
     unittest.main()

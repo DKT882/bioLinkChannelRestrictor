@@ -36,6 +36,8 @@ from telebot.async_telebot import AsyncTeleBot
 from telebot import types
 from telebot.apihelper import ApiTelegramException
 
+from database import db_manager
+
 # ------------------------------------------------------------------------------
 # 1. LOGGING SETUP
 # ------------------------------------------------------------------------------
@@ -51,6 +53,7 @@ logger = logging.getLogger("BioRestrictor")
 # ------------------------------------------------------------------------------
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 PORT = int(os.environ.get("PORT", 8080))
+MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 
 # Anonymous Admin Bot ID in Telegram
 ANONYMOUS_ADMIN_USER_ID = 1087968824
@@ -169,6 +172,13 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
             "free_list": set()
         }
         save_settings()
+        if db_manager.is_connected:
+            asyncio.create_task(db_manager.upsert_group(
+                chat_id=chat_id,
+                activated=True,
+                action="delete",
+                ignore_admins=False
+            ))
     return active_groups[chat_id]
 
 # ------------------------------------------------------------------------------
@@ -404,6 +414,22 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
     except ApiTelegramException as e:
         logger.warning(f"Could not delete message {message.message_id} in chat {chat_id}: {e}")
 
+    # Record to MongoDB audit trail asynchronously
+    if db_manager.is_connected:
+        v_type = "connected_channel" if "channel" in reason.lower() else "bio_link"
+        msg_content = message.text or message.caption or ""
+        asyncio.create_task(db_manager.log_moderation_event(
+            chat_id=chat_id,
+            user_id=user.id,
+            username=user.username or "",
+            first_name=user.first_name or "",
+            is_admin=False,
+            violation_type=v_type,
+            violation_detail=reason,
+            action_taken=action,
+            message_text=msg_content
+        ))
+
     # If action is 'delete', we are done (silently deleted)
     if action == "delete":
         return
@@ -570,6 +596,13 @@ async def cmd_setaction(message: types.Message):
     new_action = parts[1].lower()
     group_config["action"] = new_action
     save_settings()
+    if db_manager.is_connected:
+        asyncio.create_task(db_manager.upsert_group(
+            chat_id=chat_id,
+            action=new_action,
+            activated=group_config.get("activated", True),
+            ignore_admins=group_config.get("ignore_admins", False)
+        ))
 
     action_descriptions = {
         "delete": "Delete violating messages silently",
@@ -608,6 +641,13 @@ async def cmd_toggleadmin(message: types.Message):
     new_state = not current_state
     group_config["ignore_admins"] = new_state
     save_settings()
+    if db_manager.is_connected:
+        asyncio.create_task(db_manager.upsert_group(
+            chat_id=chat_id,
+            ignore_admins=new_state,
+            activated=group_config.get("activated", True),
+            action=group_config.get("action", "delete")
+        ))
 
     # Invalidate admin cache to force re-check
     admin_cache.pop(chat_id, None)
@@ -717,6 +757,14 @@ async def cmd_free(message: types.Message):
 
     group_config["free_list"].add(target_user_id)
     save_settings()
+    if db_manager.is_connected:
+        target_uname = clean_uname if 'clean_uname' in locals() else ""
+        asyncio.create_task(db_manager.add_exempt_user(
+            chat_id=chat_id,
+            user_id=target_user_id,
+            username=target_uname,
+            freed_by=admin_user_id
+        ))
 
     # Remove any cached bio flag to ensure instant clearance
     bio_cache.pop(target_user_id, None)
@@ -775,6 +823,8 @@ async def cmd_unfree(message: types.Message):
     if target_user_id in free_list:
         free_list.discard(target_user_id)
         save_settings()
+        if db_manager.is_connected:
+            asyncio.create_task(db_manager.remove_exempt_user(chat_id, target_user_id))
         bio_cache.pop(target_user_id, None)
         await bot.reply_to(message, f"✅ User <code>{target_user_id}</code> removed from exemption list.", parse_mode="HTML")
     else:
@@ -937,6 +987,7 @@ async def http_health_handler(request: web.Request) -> web.Response:
     uptime_seconds = int(time.time() - START_TIME)
     human_uptime = get_human_uptime(uptime_seconds)
     bot_connected = bot_metadata.get("connected", False)
+    db_metrics = await db_manager.get_metrics() if db_manager.is_connected else {}
 
     health_data = {
         "status": "UP" if bot_connected else "INITIALIZING",
@@ -945,6 +996,11 @@ async def http_health_handler(request: web.Request) -> web.Response:
             "status": "ONLINE" if bot_connected else "CONNECTING",
             "username": bot_metadata.get("username"),
             "id": bot_metadata.get("id"),
+        },
+        "database": {
+            "type": "MongoDB Atlas" if db_manager.is_connected else "Local In-Memory / JSON",
+            "connected": db_manager.is_connected,
+            "metrics": db_metrics
         },
         "stats": {
             "active_groups": len(active_groups),
@@ -1236,6 +1292,13 @@ async def main():
     # Start cache pruning background task
     prune_task = asyncio.create_task(cache_pruning_task())
 
+    # Connect to MongoDB Atlas (if configured)
+    await db_manager.connect(MONGO_URI)
+    if db_manager.is_connected:
+        mongo_groups = await db_manager.load_all_groups()
+        active_groups.update(mongo_groups)
+        logger.info(f"Synchronized {len(mongo_groups)} group(s) from MongoDB.")
+
     try:
         # Validate bot credentials with Telegram
         me = await bot.get_me()
@@ -1267,6 +1330,7 @@ async def main():
         prune_task.cancel()
         await web_runner.cleanup()
         await bot.close_session()
+        await db_manager.close()
         logger.info("Shutdown completed cleanly.")
 
 

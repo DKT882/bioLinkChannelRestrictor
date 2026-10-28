@@ -75,10 +75,49 @@ It actively protects Telegram groups against spam bots, promotion accounts, and 
 5. Under **Environment Variables**, add:
    - `BOT_TOKEN`: Your Telegram Bot token from [@BotFather](https://t.me/BotFather).
    - `PORT`: `8080` (Render also sets this automatically).
-6. Click **Create Web Service**. Render will build and deploy the container. Render's health checks will query `http://0.0.0.0:8080/` and verify the service is running.
+   - `MONGO_URI`: *(Optional but recommended)* Your MongoDB Atlas connection URI (`mongodb+srv://...`).
+6. Click **Create Web Service**. Render will build and deploy the container. Render's health checks will query `http://0.0.0.0:8080/health` and verify the service is running.
 
 ### Method 2: Render Blueprint (`render.yaml`)
-If deploying via Render Blueprints, Render will automatically detect `render.yaml` in the root of the repository and configure all settings. You only need to enter your `BOT_TOKEN`.
+If deploying via Render Blueprints, Render will automatically detect `render.yaml` in the root of the repository and configure all settings. You only need to enter your `BOT_TOKEN` and optional `MONGO_URI`.
+
+---
+
+## 🗄️ Database Architecture & MongoDB Schema
+
+The bot operates a **Hybrid Write-Through Cache**:
+* **Read Throughput**: In-memory Python dictionaries for $O(1)$ sub-millisecond lookups on every message.
+* **Durability**: Persistent MongoDB Atlas sync for zero data loss on restarts/redeployments.
+
+### 1. `groups` Collection (Settings & Exemptions)
+- `_id`: `int64` (Telegram `chat_id` as clustered primary key for $O(1)$ lookups)
+- `title`: `string` (Telegram group title)
+- `activated`: `bool` (Default: `true`)
+- `action`: `string` ("delete" | "warn" | "mute" | "ban", Default: `"delete"`)
+- `ignore_admins`: `bool` (Default: `false`)
+- `free_list`: `Array[int64]` (Indexed array of exempt user IDs)
+- `exemptions_detail`: `Array[Object]` (`user_id`, `username`, `freed_by`, `freed_at`)
+- `updated_at`: `ISODate`
+
+### 2. `moderation_logs` Collection (Audit Trail)
+- `_id`: `ObjectId`
+- `chat_id`: `int64` (Indexed)
+- `user_id`: `int64` (Violating user ID)
+- `username`: `string`
+- `first_name`: `string`
+- `violation_type`: `"connected_channel"` | `"bio_link"`
+- `violation_detail`: Matched URL or connected channel handle
+- `action_taken`: `"delete"` | `"warn"` | `"mute"` | `"ban"`
+- `created_at`: `ISODate` (**90-Day TTL Index**: Automatically purges old logs to conserve free tier storage!)
+
+### 3. `bot_metrics` Collection (Global Counters)
+- `_id`: `"global_metrics"`
+- `total_violations_handled`: `int64`
+- `total_connected_channels_caught`: `int64`
+- `total_bio_links_caught`: `int64`
+- `last_heartbeat`: `ISODate`
+
+---
 
 > 💡 **Keep-Alive Tip for Render Free Tier**:
 > Render's free web services sleep after 15 minutes of inactivity if no incoming HTTP traffic is detected. To keep your Telegram bot alive 24/7, set up a free monitor on [UptimeRobot](https://uptimerobot.com) or [Cron-job.org](https://cron-job.org) pinging your Render URL (e.g. `https://your-bot.onrender.com/healthz`) every 5 to 10 minutes.
