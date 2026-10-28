@@ -1011,7 +1011,55 @@ async def cache_pruning_task():
 
 
 # ------------------------------------------------------------------------------
-# 10. MAIN ENTRYPOINT
+# 10. TELEGRAM BOT COMMAND CATALOG (SCOPED FOR ADMINISTRATORS)
+# ------------------------------------------------------------------------------
+
+async def register_bot_commands():
+    """
+    Registers the bot command catalog with Telegram Bot API.
+    Scoped specifically so admin commands only appear for chat administrators.
+    """
+    admin_commands = [
+        types.BotCommand("start", "Activate bio link protection in group"),
+        types.BotCommand("setaction", "Set punishment: delete, warn, mute, ban"),
+        types.BotCommand("toggleadmin", "Toggle skipping admins (default: True)"),
+        types.BotCommand("free", "Exempt a user permanently (reply or @user)"),
+        types.BotCommand("unfree", "Remove user from exemption list"),
+        types.BotCommand("status", "Show current group protection status"),
+        types.BotCommand("help", "Show administrator commands & usage guide"),
+    ]
+
+    private_commands = [
+        types.BotCommand("start", "Start the bot & get setup instructions"),
+        types.BotCommand("help", "Show setup & administration guide"),
+    ]
+
+    try:
+        # 1. Group Administrators: Show all management commands
+        await bot.set_my_commands(
+            commands=admin_commands,
+            scope=types.BotCommandScopeAllChatAdministrators()
+        )
+
+        # 2. Regular Group Members: Hide commands from group popup menu
+        await bot.set_my_commands(
+            commands=[],
+            scope=types.BotCommandScopeAllGroupChats()
+        )
+
+        # 3. Private Chat (DM with Bot): Show basic setup guide commands
+        await bot.set_my_commands(
+            commands=private_commands,
+            scope=types.BotCommandScopeAllPrivateChats()
+        )
+
+        logger.info("Bot command catalog successfully registered for administrators.")
+    except Exception as e:
+        logger.warning(f"Failed to register bot commands with Telegram: {e}")
+
+
+# ------------------------------------------------------------------------------
+# 11. MAIN ENTRYPOINT
 # ------------------------------------------------------------------------------
 
 async def main():
@@ -1037,6 +1085,10 @@ async def main():
         bot_metadata["first_name"] = me.first_name
         bot_metadata["connected"] = True
         logger.info(f"Bot connected successfully as @{me.username} (ID: {me.id})")
+
+        # Register scoped bot commands in Telegram catalog (Admins only for groups)
+        await register_bot_commands()
+
         logger.info("Starting Telegram Bot non-blocking infinity polling...")
 
         # Start non-blocking infinity polling
