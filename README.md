@@ -127,22 +127,35 @@ Bot connected successfully as @YourBotName (ID: 123456789)
 Starting Telegram Bot non-blocking infinity polling...
 ```
 
-You can verify the HTTP health check locally by visiting:
-[http://localhost:8080/](http://localhost:8080/) or running:
+You can verify the HTTP health check locally by visiting in your browser:
+👉 **[http://localhost:8080/health](http://localhost:8080/health)**
+
+- **In a Web Browser**: Displays a dark-mode status dashboard showing Bot Connection, Uptime, Monitored Groups, and Cache metrics.
+- **In Postman or cURL**: Returns formatted JSON status:
 ```bash
-curl http://localhost:8080/healthz
+curl http://localhost:8080/health
 ```
 Response:
 ```json
 {
-  "status": "healthy",
+  "status": "UP",
   "service": "BioLinkChannelRestrictorBot",
-  "active_groups": 0,
-  "cached_admins_chats": 0,
-  "cached_user_bios": 0,
-  "uptime_seconds": 15,
-  "timestamp": 1793200000
+  "telegram_bot": {
+    "status": "ONLINE",
+    "username": "YourBotUsername",
+    "id": 123456789
+  },
+  "stats": {
+    "active_groups": 2,
+    "cached_admins_chats": 2,
+    "cached_user_bios": 15
+  },
+  "uptime": "0d 2h 15m 30s",
+  "uptime_seconds": 8130,
+  "timestamp": "2026-10-28 15:52:00 UTC"
 }
+```
+*(Tip: In a browser, you can also view the raw JSON at `http://localhost:8080/health?format=json`)*
 ```
 
 ---

@@ -87,6 +87,14 @@ ALL_CONTENT_TYPES = [
 # Track process start time for uptime reporting
 START_TIME = time.time()
 
+# Metadata for bot health reporting
+bot_metadata: Dict[str, Any] = {
+    "id": None,
+    "username": None,
+    "first_name": None,
+    "connected": False
+}
+
 # ------------------------------------------------------------------------------
 # 3. IN-MEMORY STATE & CACHES
 # ------------------------------------------------------------------------------
@@ -742,24 +750,208 @@ async def process_chat_message(message: types.Message):
 
 
 # ------------------------------------------------------------------------------
-# 8. LIGHTWEIGHT HTTP WEB SERVER (FOR RENDER HEALTH CHECKS)
+# 8. LIGHTWEIGHT HTTP WEB SERVER (FOR BROWSER, POSTMAN & RENDER HEALTH CHECKS)
 # ------------------------------------------------------------------------------
+
+def get_human_uptime(total_seconds: int) -> str:
+    """Formats uptime seconds into a human-readable duration (e.g. '1d 4h 32m 10s')."""
+    days, rem = divmod(total_seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, seconds = divmod(rem, 60)
+    parts = []
+    if days > 0:
+        parts.append(f"{days}d")
+    if hours > 0:
+        parts.append(f"{hours}h")
+    if minutes > 0:
+        parts.append(f"{minutes}m")
+    parts.append(f"{seconds}s")
+    return " ".join(parts) if parts else "0s"
+
 
 async def http_health_handler(request: web.Request) -> web.Response:
     """
-    Health check endpoint satisfying Render's port binding and HTTP 200 requirement.
+    Health check endpoint for Postman, browsers, and Render health checks.
+    - If requested via Postman / API / Accept: application/json -> Returns formatted JSON.
+    - If accessed directly in a browser (Accept: text/html) -> Returns a sleek HTML dashboard.
     """
     uptime_seconds = int(time.time() - START_TIME)
-    data = {
-        "status": "healthy",
+    human_uptime = get_human_uptime(uptime_seconds)
+    bot_connected = bot_metadata.get("connected", False)
+
+    health_data = {
+        "status": "UP" if bot_connected else "INITIALIZING",
         "service": "BioLinkChannelRestrictorBot",
-        "active_groups": len(active_groups),
-        "cached_admins_chats": len(admin_cache),
-        "cached_user_bios": len(bio_cache),
+        "telegram_bot": {
+            "status": "ONLINE" if bot_connected else "CONNECTING",
+            "username": bot_metadata.get("username"),
+            "id": bot_metadata.get("id"),
+        },
+        "stats": {
+            "active_groups": len(active_groups),
+            "cached_admins_chats": len(admin_cache),
+            "cached_user_bios": len(bio_cache),
+        },
+        "uptime": human_uptime,
         "uptime_seconds": uptime_seconds,
-        "timestamp": int(time.time()),
+        "timestamp": time.strftime("%Y-%m-%d %H:%M:%S UTC", time.gmtime()),
     }
-    return web.json_response(data)
+
+    # Detect if request is from a web browser looking for an HTML page
+    accept_header = request.headers.get("Accept", "").lower()
+    format_query = request.query.get("format", "").lower()
+    wants_html = ("text/html" in accept_header) and (format_query != "json")
+
+    if wants_html:
+        bot_user_str = f"@{bot_metadata.get('username')}" if bot_metadata.get("username") else "Connecting..."
+        status_color = "#10b981" if bot_connected else "#f59e0b"
+        status_text = "Operational" if bot_connected else "Connecting"
+
+        html_content = f"""<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Bot Status | BioLink Channel Restrictor</title>
+  <style>
+    * {{ box-sizing: border-box; }}
+    body {{
+      font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
+      background: #0f172a;
+      color: #f8fafc;
+      margin: 0;
+      padding: 40px 16px;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      min-height: 100vh;
+    }}
+    .container {{
+      background: #1e293b;
+      border-radius: 16px;
+      border: 1px solid #334155;
+      padding: 32px;
+      width: 100%;
+      max-width: 580px;
+      box-shadow: 0 20px 25px -5px rgba(0, 0, 0, 0.4);
+    }}
+    .header {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid #334155;
+      padding-bottom: 20px;
+      margin-bottom: 24px;
+    }}
+    .title {{
+      font-size: 20px;
+      font-weight: 700;
+      margin: 0;
+      color: #ffffff;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+    }}
+    .badge {{
+      background: rgba(16, 185, 129, 0.15);
+      color: {status_color};
+      border: 1px solid {status_color};
+      padding: 6px 14px;
+      border-radius: 9999px;
+      font-size: 13px;
+      font-weight: 600;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }}
+    .badge::before {{
+      content: "";
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      background: {status_color};
+      box-shadow: 0 0 8px {status_color};
+    }}
+    .grid {{
+      display: grid;
+      grid-template-columns: repeat(2, 1fr);
+      gap: 14px;
+      margin-bottom: 24px;
+    }}
+    .card {{
+      background: #0f172a;
+      border: 1px solid #334155;
+      border-radius: 12px;
+      padding: 16px;
+    }}
+    .card-label {{
+      font-size: 11px;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #94a3b8;
+      font-weight: 600;
+      margin-bottom: 6px;
+    }}
+    .card-val {{
+      font-size: 18px;
+      font-weight: 700;
+      color: #f1f5f9;
+    }}
+    .footer {{
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-top: 1px solid #334155;
+      padding-top: 18px;
+      font-size: 13px;
+      color: #64748b;
+    }}
+    .footer a {{
+      color: #38bdf8;
+      text-decoration: none;
+      font-weight: 500;
+    }}
+    .footer a:hover {{
+      text-decoration: underline;
+    }}
+  </style>
+</head>
+<body>
+  <div class="container">
+    <div class="header">
+      <div class="title">🛡️ BioLink Restrictor</div>
+      <div class="badge">{status_text}</div>
+    </div>
+    <div class="grid">
+      <div class="card">
+        <div class="card-label">Telegram Bot</div>
+        <div class="card-val">{bot_user_str}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Uptime</div>
+        <div class="card-val">{human_uptime}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Active Groups</div>
+        <div class="card-val">{len(active_groups)}</div>
+      </div>
+      <div class="card">
+        <div class="card-label">Cached Bios</div>
+        <div class="card-val">{len(bio_cache)}</div>
+      </div>
+    </div>
+    <div class="footer">
+      <span>Render Web Service</span>
+      <a href="/health?format=json" target="_blank">View Raw JSON &rarr;</a>
+    </div>
+  </div>
+</body>
+</html>
+"""
+        return web.Response(text=html_content, content_type="text/html", status=200)
+
+    # Otherwise, return JSON formatted response for Postman / API / Render health checks
+    return web.json_response(health_data, status=200)
 
 
 async def start_web_server() -> web.AppRunner:
@@ -840,6 +1032,10 @@ async def main():
     try:
         # Validate bot credentials with Telegram
         me = await bot.get_me()
+        bot_metadata["id"] = me.id
+        bot_metadata["username"] = me.username
+        bot_metadata["first_name"] = me.first_name
+        bot_metadata["connected"] = True
         logger.info(f"Bot connected successfully as @{me.username} (ID: {me.id})")
         logger.info("Starting Telegram Bot non-blocking infinity polling...")
 

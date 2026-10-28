@@ -121,15 +121,22 @@ class TestHttpServer(AioHTTPTestCase):
         app.router.add_get("/healthz", http_health_handler)
         return app
 
-    @unittest_run_loop
-    async def test_health_endpoints(self):
+    async def test_health_json_endpoints(self):
         for path in ["/", "/health", "/healthz"]:
-            resp = await self.client.request("GET", path)
+            resp = await self.client.request("GET", path, headers={"Accept": "application/json"})
             self.assertEqual(resp.status, 200)
             data = await resp.json()
-            self.assertEqual(data["status"], "healthy")
+            self.assertIn("status", data)
             self.assertEqual(data["service"], "BioLinkChannelRestrictorBot")
             self.assertIn("uptime_seconds", data)
+
+    async def test_health_html_browser_view(self):
+        resp = await self.client.request("GET", "/health", headers={"Accept": "text/html,application/xhtml+xml"})
+        self.assertEqual(resp.status, 200)
+        self.assertIn("text/html", resp.headers.get("Content-Type", ""))
+        text = await resp.text()
+        self.assertIn("BioLink Restrictor", text)
+        self.assertIn("Active Groups", text)
 
 
 if __name__ == "__main__":
