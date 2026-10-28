@@ -14,6 +14,9 @@ from main import (
     username_to_id,
     admin_cache,
     bio_cache,
+    get_group_config,
+    save_settings,
+    load_settings,
     ADMIN_CACHE_TTL,
     BIO_CACHE_TTL,
     http_health_handler
@@ -63,63 +66,56 @@ class TestBioRegex(unittest.TestCase):
         self.assertFalse(contains_link_or_handle(""))
         self.assertFalse(contains_link_or_handle(None))
 
+    def test_connected_channel_concept(self):
+        from telebot import types
+        # User with connected channel
+        personal_chan = types.Chat(id=-1001234, type="channel", title="VIP Channel", username="vip_chan")
+        chat_with_chan = types.ChatFullInfo(id=999, type="private", bio="No links in bio", personal_chat=personal_chan)
+        self.assertIsNotNone(getattr(chat_with_chan, "personal_chat", None))
+
+        # User without connected channel
+        chat_without_chan = types.ChatFullInfo(id=888, type="private", bio="No links in bio")
+        self.assertIsNone(getattr(chat_without_chan, "personal_chat", None))
+
 class TestStateManagement(unittest.TestCase):
     def setUp(self):
         active_groups.clear()
         admin_cache.clear()
         bio_cache.clear()
 
-    def test_default_passive_state(self):
-        # A group not in active_groups must be passive
+    def test_default_active_state(self):
+        # A group should automatically be active by default with no /start needed
         chat_id = -1001234567890
-        self.assertNotIn(chat_id, active_groups)
-
-    def test_activation_defaults(self):
-        chat_id = -1001234567890
-        active_groups[chat_id] = {
-            "activated": True,
-            "action": "delete",
-            "ignore_admins": True,
-            "free_list": set()
-        }
-        config = active_groups[chat_id]
+        config = get_group_config(chat_id)
         self.assertTrue(config["activated"])
         self.assertEqual(config["action"], "delete")
-        self.assertTrue(config["ignore_admins"])
+        # By default, admins are NOT ignored (they are scanned and deleted too)
+        self.assertFalse(config["ignore_admins"])
         self.assertEqual(len(config["free_list"]), 0)
 
     def test_free_list_operations(self):
         chat_id = -1001234567890
-        active_groups[chat_id] = {
-            "activated": True,
-            "action": "delete",
-            "ignore_admins": True,
-            "free_list": set()
-        }
-        # Add user to free_list
+        config = get_group_config(chat_id)
         user_id = 987654321
-        active_groups[chat_id]["free_list"].add(user_id)
-        self.assertIn(user_id, active_groups[chat_id]["free_list"])
+        config["free_list"].add(user_id)
+        self.assertIn(user_id, config["free_list"])
 
-        # Remove user from free_list
-        active_groups[chat_id]["free_list"].discard(user_id)
-        self.assertNotIn(user_id, active_groups[chat_id]["free_list"])
+        config["free_list"].discard(user_id)
+        self.assertNotIn(user_id, config["free_list"])
 
     def test_toggle_admin(self):
         chat_id = -1001234567890
-        active_groups[chat_id] = {
-            "activated": True,
-            "action": "delete",
-            "ignore_admins": True,
-            "free_list": set()
-        }
-        # Toggle to False
-        active_groups[chat_id]["ignore_admins"] = not active_groups[chat_id]["ignore_admins"]
-        self.assertFalse(active_groups[chat_id]["ignore_admins"])
+        config = get_group_config(chat_id)
+        # Default is False (admins are scanned)
+        self.assertFalse(config["ignore_admins"])
 
-        # Toggle back to True
-        active_groups[chat_id]["ignore_admins"] = not active_groups[chat_id]["ignore_admins"]
-        self.assertTrue(active_groups[chat_id]["ignore_admins"])
+        # Toggle to True (admins exempt)
+        config["ignore_admins"] = not config["ignore_admins"]
+        self.assertTrue(config["ignore_admins"])
+
+        # Toggle back to False
+        config["ignore_admins"] = not config["ignore_admins"]
+        self.assertFalse(config["ignore_admins"])
 
 
 class TestHttpServer(AioHTTPTestCase):

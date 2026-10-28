@@ -11,6 +11,9 @@ venv/
 # Environment files
 .env
 
+# Local state
+settings.json
+
 # Test & coverage
 .coverage
 htmlcov/

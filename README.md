@@ -22,37 +22,41 @@ It actively protects Telegram groups against spam bots, promotion accounts, and 
 
 ### 1. State Management & Activation
 - **In-Memory Tracking**: Groups are stored in `active_groups[chat_id]`.
-- **Passive State**: Stays inactive upon joining a group chat. It does not delete or process any messages until activated.
-- **Activation (`/start`)**: Initialized exclusively by group administrators with default settings:
-  - `activated = True`
-  - `action = "delete"`
-  - `ignore_admins = True`
+### 1. Zero-Setup Default Activation & Persistence
+- **Always Active by Default**: The bot protects all groups immediately upon joining. No `/start` command or manual setup is needed after joining or after Render redeployments.
+- **Default Protection**:
+  - Messages from members who have links, handles, or connected channels are **deleted**.
+  - Messages from **admins** who have links, handles, or connected channels are **also deleted**.
+- **Settings Persistence**: Saves configurations and exemption lists to `settings.json` so custom settings survive redeployments.
 
 ### 2. Administrator Feature Controls
-- **`/setaction <delete|warn|mute|ban>`**: Configures the punishment applied when a user has a bio link:
-  - `delete`: Silently deletes the violating message.
+- **`/setaction <delete|warn|mute|ban>`**: Configures the punishment applied when a user/admin has a bio link or connected channel:
+  - `delete`: Silently deletes the violating message (Default).
   - `warn`: Deletes the message and sends a warning in the group (auto-deleted after 12s to prevent chat clutter).
   - `mute`: Deletes the message and restricts the user from sending messages in the chat.
   - `ban`: Deletes the message and permanently bans the user from the group.
-- **`/toggleadmin`**: Toggles whether group administrators and anonymous admins are exempted (Default: `True` / exempt).
+- **`/toggleadmin`**: Toggles whether group administrators are exempted (Default: `False` / admins are scanned and deleted too).
 - **`/status`**: Displays a real-time configuration dashboard of the group.
 - **`/help`**: Lists available commands and usage instructions.
 
 ### 3. Exemption Command (`/free` & `/unfree`)
+- **Restricted To**: **Group Owner (Creator)** and **Anonymous Admin** only.
+- **Applies To**: Works for regular members as well as group administrators.
 - **`/free`**:
   - Reply to any message: `/free`
   - Mention handle: `/free @username`
   - Direct user ID: `/free 123456789`
-  - Adds the user's ID to `active_groups[chat_id]["free_list"]`. Exempted users bypass all bio checks permanently.
+  - Adds the target ID to the chat's exemption list.
 - **`/unfree`**:
-  - Removes a user from the chat's exemption list.
+  - Removes a user or admin from the chat's exemption list.
 
 ### 4. Anti-Spam / Filter Engine
-- Intercepts all incoming and edited messages across all media types (text, photos, stickers, animations, videos, voices, etc.).
-- **Fast Check 1**: Checks if sender is Admin or Anonymous Admin AND `ignore_admins` is enabled (`O(1)` memory check).
-- **Fast Check 2**: Checks if sender is on the chat's `free_list` (`O(1)` set lookup).
-- **Bio Scan**: Fetches Full Info profile asynchronously (`bot.get_chat(user_id)`). Scans the `bio` attribute using a comprehensive regex covering `http://`, `https://`, `t.me/`, `.com`, `.org`, link aggregators (`bio.link`, `linktr.ee`), and `@usernames`.
-- **Action Trigger**: If a promotional link or handle is detected in their bio, executes the configured action.
+- Intercepts all incoming and edited messages across all media types.
+- **Check 1: Connected Channel Detection**: Inspects `personal_chat` on the user's profile. If the user or admin has attached a personal Telegram channel to their profile, their message is deleted immediately!
+- **Check 2: Bio & Profile Links**: Inspects `chat.bio` and `business_intro` using a comprehensive regex covering `http://`, `https://`, `t.me/`, website domains (`.com`, `.net`, `.xyz`, etc.), link aggregators (`bio.link`, `linktr.ee`, `taplink.cc`), and `@channel` handles.
+- **Check 3: Exemption Check**: Bypasses anyone on the chat's `/free` list.
+- **Check 4: Admin Filtering**: Admins are filtered by default unless `/toggleadmin` is used.
+- **Action Trigger**: Deletes message (or warns/mutes/bans) asynchronously with sub-millisecond return.
 
 ---
 

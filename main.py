@@ -18,6 +18,7 @@ import sys
 import re
 import html
 import time
+import json
 import asyncio
 import logging
 from typing import Dict, Set, Any, Optional, Tuple
@@ -96,16 +97,9 @@ bot_metadata: Dict[str, Any] = {
 }
 
 # ------------------------------------------------------------------------------
-# 3. IN-MEMORY STATE & CACHES
+# 3. IN-MEMORY STATE, PERSISTENCE & CACHES
 # ------------------------------------------------------------------------------
-# Active group configurations: chat_id (int) -> dict
-# Key: chat_id, Value: {
-#     "activated": bool,
-#     "action": str ("delete" | "warn" | "mute" | "ban"),
-#     "ignore_admins": bool,
-#     "free_list": Set[int]
-# }
-active_groups: Dict[int, Dict[str, Any]] = {}
+SETTINGS_FILE = "settings.json"
 
 # In-memory mapping from lowercase username to user_id (built dynamically)
 username_to_id: Dict[str, int] = {}
@@ -113,12 +107,69 @@ username_to_id: Dict[str, int] = {}
 # Admin status cache: chat_id -> (set of admin user IDs, expire_monotonic_timestamp)
 admin_cache: Dict[int, Tuple[Set[int], float]] = {}
 
-# Bio scan cache: user_id -> (has_violating_link: bool, expire_monotonic_timestamp)
-bio_cache: Dict[int, Tuple[bool, float]] = {}
+# Bio scan cache: user_id -> (has_violation: bool, reason: str, expire_monotonic_timestamp)
+bio_cache: Dict[int, Tuple[bool, str, float]] = {}
 
 # In-flight request de-duplication to prevent cache stampedes / thundering herd
 in_flight_admin_scans: Dict[int, asyncio.Future] = {}
 in_flight_bio_scans: Dict[int, asyncio.Future] = {}
+
+def load_settings() -> Dict[int, Dict[str, Any]]:
+    """Loads saved settings from settings.json if present."""
+    groups: Dict[int, Dict[str, Any]] = {}
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                for cid_str, cfg in data.items():
+                    cid = int(cid_str)
+                    groups[cid] = {
+                        "activated": cfg.get("activated", True),
+                        "action": cfg.get("action", "delete"),
+                        "ignore_admins": cfg.get("ignore_admins", False),
+                        "free_list": set(cfg.get("free_list", []))
+                    }
+            logger.info(f"Loaded persistent configurations for {len(groups)} group(s).")
+        except Exception as e:
+            logger.error(f"Failed to load {SETTINGS_FILE}: {e}")
+    return groups
+
+# Initialize active_groups from disk if available
+active_groups: Dict[int, Dict[str, Any]] = load_settings()
+
+def save_settings():
+    """Persists active group configurations to settings.json."""
+    try:
+        data = {}
+        for cid, cfg in active_groups.items():
+            data[str(cid)] = {
+                "activated": cfg.get("activated", True),
+                "action": cfg.get("action", "delete"),
+                "ignore_admins": cfg.get("ignore_admins", False),
+                "free_list": list(cfg.get("free_list", set()))
+            }
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error(f"Failed to save {SETTINGS_FILE}: {e}")
+
+def get_group_config(chat_id: int) -> Dict[str, Any]:
+    """
+    Returns the group config, automatically initializing it with default values:
+    - activated: True (Active by default across all groups, no /start needed!)
+    - action: 'delete' (Delete violating messages by default)
+    - ignore_admins: False (Scan & delete messages of admins with bio links/channels too)
+    - free_list: set()
+    """
+    if chat_id not in active_groups:
+        active_groups[chat_id] = {
+            "activated": True,
+            "action": "delete",
+            "ignore_admins": False,
+            "free_list": set()
+        }
+        save_settings()
+    return active_groups[chat_id]
 
 # ------------------------------------------------------------------------------
 # 4. INITIALIZE ASYNC TELEBOT
@@ -203,21 +254,46 @@ async def is_user_admin(chat_id: int, user_id: int, message: Optional[types.Mess
         in_flight_admin_scans.pop(chat_id, None)
 
 
-async def scan_user_bio(user_id: int) -> bool:
+async def is_owner_or_anonymous_admin(chat_id: int, user_id: int, message: Optional[types.Message] = None) -> bool:
     """
-    Scans a user's Telegram profile bio asynchronously with:
-    1. In-memory TTL caching (15 mins)
-    2. In-flight request de-duplication (prevents thundering herd on message bursts)
-    3. FloodWait 429 backoff handling
-    4. Sub-millisecond string pre-filtering
+    Verifies if the caller is the Group Owner (creator) or an Anonymous Admin.
+    Only the Group Owner and Anonymous Admin are permitted to exempt/unexempt users.
+    """
+    if message:
+        # Sender posting anonymously as the group
+        if message.sender_chat and message.sender_chat.id == chat_id:
+            return True
+        # Anonymous admin bot identifier
+        if message.from_user and message.from_user.id == ANONYMOUS_ADMIN_USER_ID:
+            return True
+
+    if not user_id:
+        return False
+
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        return member.status == "creator"
+    except Exception as e:
+        logger.error(f"Error checking owner status for user {user_id} in {chat_id}: {e}")
+        return False
+
+
+async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
+    """
+    Scans a user's Telegram profile.
+    Detects:
+    1. Connected personal channels on profile (personal_chat).
+    2. Promotional URLs, web domains, and @channel handles in bio.
+    3. Telegram Business intro links or handles.
+    Returns (has_violation: bool, reason: str).
     """
     now = time.monotonic()
 
     # Fast in-memory cache check
     if user_id in bio_cache:
-        has_link, expiry = bio_cache[user_id]
+        has_violating, reason, expiry = bio_cache[user_id]
         if now < expiry:
-            return has_link
+            return has_violating, reason
 
     # In-flight de-duplication: if multiple messages from same user arrive concurrently
     if user_id in in_flight_bio_scans:
@@ -232,30 +308,65 @@ async def scan_user_bio(user_id: int) -> bool:
 
     try:
         chat = await bot.get_chat(user_id)
-        bio_text = getattr(chat, "bio", None) or ""
-        has_link = contains_link_or_handle(bio_text)
-        bio_cache[user_id] = (has_link, now + BIO_CACHE_TTL)
+
+        # ----------------------------------------------------------------------
+        # Check 1: Connected Channel attached to user's profile
+        # ----------------------------------------------------------------------
+        personal_chat = getattr(chat, "personal_chat", None)
+        if personal_chat is not None:
+            chan_name = getattr(personal_chat, "username", None)
+            chan_title = getattr(personal_chat, "title", "Connected Channel")
+            chan_str = f"@{chan_name}" if chan_name else f"'{chan_title}'"
+            reason = f"Connected channel on profile: {chan_str}"
+            bio_cache[user_id] = (True, reason, now + BIO_CACHE_TTL)
+            if not future.done():
+                future.set_result((True, reason))
+            logger.info(f"User {user_id} flagged: {reason}")
+            return True, reason
+
+        # ----------------------------------------------------------------------
+        # Check 2: Profile Bio Text
+        # ----------------------------------------------------------------------
+        bio_text = getattr(chat, "bio", "") or getattr(chat, "description", "") or ""
+
+        # ----------------------------------------------------------------------
+        # Check 3: Telegram Business Intro
+        # ----------------------------------------------------------------------
+        b_intro = getattr(chat, "business_intro", None)
+        if b_intro:
+            b_msg = getattr(b_intro, "message", "") or ""
+            b_title = getattr(b_intro, "title", "") or ""
+            bio_text = f"{bio_text} {b_title} {b_msg}".strip()
+
+        if bio_text and BIO_LINK_REGEX.search(bio_text):
+            reason = f"Link or channel handle in bio: {bio_text!r}"
+            bio_cache[user_id] = (True, reason, now + BIO_CACHE_TTL)
+            if not future.done():
+                future.set_result((True, reason))
+            logger.info(f"User {user_id} flagged: {reason}")
+            return True, reason
+
+        # Clean profile
+        bio_cache[user_id] = (False, "", now + BIO_CACHE_TTL)
         if not future.done():
-            future.set_result(has_link)
-        if has_link:
-            logger.info(f"Detected restricted link/handle in bio of user {user_id}: {bio_text!r}")
-        return has_link
+            future.set_result((False, ""))
+        return False, ""
+
     except ApiTelegramException as e:
         if not future.done():
-            future.set_result(False)
-        # Handle FloodWait or user not found
+            future.set_result((False, ""))
         if e.error_code == 429:
             retry_after = getattr(e, "result_json", {}).get("parameters", {}).get("retry_after", 5)
             logger.warning(f"Telegram FloodWait encountered for user {user_id}. Backing off for {retry_after}s.")
-            bio_cache[user_id] = (False, now + float(retry_after))
+            bio_cache[user_id] = (False, "", now + float(retry_after))
         else:
-            bio_cache[user_id] = (False, now + 60.0)
-        return False
+            bio_cache[user_id] = (False, "", now + 60.0)
+        return False, ""
     except Exception as e:
         if not future.done():
-            future.set_result(False)
+            future.set_result((False, ""))
         logger.error(f"Unexpected error fetching bio for user {user_id}: {e}")
-        return False
+        return False, ""
     finally:
         in_flight_bio_scans.pop(user_id, None)
 
@@ -277,15 +388,15 @@ async def auto_delete_message(chat_id: int, message_id: int, delay_seconds: int 
         pass
 
 
-async def execute_action(message: types.Message, action: str):
+async def execute_action(message: types.Message, action: str, reason: str = ""):
     """
-    Executes the configured action (delete, warn, mute, ban) against a violating user.
+    Executes the configured action (delete, warn, mute, ban) against a violating user/admin.
     """
     chat_id = message.chat.id
     user = message.from_user
     mention = get_user_mention(user)
 
-    logger.info(f"Triggering action '{action}' on user {user.id} in chat {chat_id}")
+    logger.info(f"Triggering action '{action}' on user {user.id} in chat {chat_id}. Reason: {reason}")
 
     # Step 1: Always delete the violating message
     try:
@@ -293,24 +404,22 @@ async def execute_action(message: types.Message, action: str):
     except ApiTelegramException as e:
         logger.warning(f"Could not delete message {message.message_id} in chat {chat_id}: {e}")
 
-    # Step 2: Execute specific configured action
-    try:
-        if action == "delete":
-            # Silently deleted, no further action required
-            pass
+    # If action is 'delete', we are done (silently deleted)
+    if action == "delete":
+        return
 
-        elif action == "warn":
+    # Step 2: Execute specific configured action if not silent delete
+    try:
+        if action == "warn":
             warn_text = (
                 f"⚠️ <b>Warning {mention}!</b>\n\n"
-                f"Your message was removed because your profile bio contains a restricted link or channel handle.\n"
-                f"<i>Please remove any links or @handles from your bio to chat in this group.</i>"
+                f"Your message was removed because your profile contains a restricted link or connected channel.\n"
+                f"<i>Please remove any links, @handles, or connected channels to chat here.</i>"
             )
             warn_msg = await bot.send_message(chat_id, warn_text, parse_mode="HTML")
-            # Auto-delete warning after 12s to avoid cluttering group discussion
             asyncio.create_task(auto_delete_message(chat_id, warn_msg.message_id, 12))
 
         elif action == "mute":
-            # Restrict permissions: disable sending messages
             permissions = types.ChatPermissions(
                 can_send_messages=False,
                 can_send_media_messages=False,
@@ -320,7 +429,7 @@ async def execute_action(message: types.Message, action: str):
             await bot.restrict_chat_member(chat_id, user.id, permissions=permissions)
             mute_text = (
                 f"🔇 {mention} has been <b>muted</b>.\n"
-                f"Reason: Promotional link or channel handle detected in profile bio."
+                f"Reason: {html.escape(reason or 'Restricted link or connected channel.')}"
             )
             mute_msg = await bot.send_message(chat_id, mute_text, parse_mode="HTML")
             asyncio.create_task(auto_delete_message(chat_id, mute_msg.message_id, 30))
@@ -329,14 +438,13 @@ async def execute_action(message: types.Message, action: str):
             await bot.ban_chat_member(chat_id, user.id)
             ban_text = (
                 f"🚫 {mention} has been <b>banned</b> from the group.\n"
-                f"Reason: Promotional link or channel handle detected in profile bio."
+                f"Reason: {html.escape(reason or 'Restricted link or connected channel.')}"
             )
             ban_msg = await bot.send_message(chat_id, ban_text, parse_mode="HTML")
             asyncio.create_task(auto_delete_message(chat_id, ban_msg.message_id, 30))
 
     except ApiTelegramException as e:
         logger.error(f"Failed to execute action '{action}' on user {user.id} in chat {chat_id}: {e}")
-        # Notify admins if bot lacks necessary rights
         if "not enough rights" in str(e).lower() or "admin" in str(e).lower():
             try:
                 err_notice = (
@@ -356,9 +464,8 @@ async def execute_action(message: types.Message, action: str):
 @bot.message_handler(commands=["start"])
 async def cmd_start(message: types.Message):
     """
-    /start: Activates the bot in a group chat (Admin Only), or sends intro in DM.
-    Default state when bot is added to group: PASSIVE (does not delete/process).
-    Activated ONLY upon /start by an admin.
+    /start: Displays group status (Admin Only) or DM introduction.
+    Note: The bot is ACTIVE BY DEFAULT across all groups without needing /start.
     """
     chat = message.chat
 
@@ -366,18 +473,22 @@ async def cmd_start(message: types.Message):
     if chat.type == "private":
         welcome_text = (
             "👋 <b>Welcome to BioLink Channel Restrictor!</b>\n\n"
-            "This bot keeps group chats clean by scanning members' profile bios "
-            "for promotional URLs, link aggregators, and channel handles.\n\n"
+            "This bot automatically keeps group chats clean by scanning members' profiles "
+            "for promotional URLs, link aggregators, channel @handles, and <b>connected channels</b>.\n\n"
+            "<b>Default Protection:</b>\n"
+            "• Active by default in every group (no setup needed).\n"
+            "• Automatically deletes messages from users AND admins with bio links or connected channels.\n\n"
             "<b>Setup Instructions:</b>\n"
             "1️⃣ Add this bot to your Telegram Group.\n"
             "2️⃣ Promote it to <b>Administrator</b> with permissions to <i>Delete Messages</i> "
             "(and <i>Ban/Restrict Users</i> if you plan to mute or ban).\n"
-            "3️⃣ Send <code>/start</code> in your group to activate protection!\n\n"
+            "3️⃣ Protection is instantly live!\n\n"
             "<b>Admin Commands:</b>\n"
-            "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code> - Set punishment\n"
-            "• <code>/toggleadmin</code> - Toggle admin exemption\n"
-            "• <code>/free</code> (reply or @username) - Exempt a trusted user\n"
-            "• <code>/status</code> - View group configuration"
+            "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code> - Configure punishment (Default: delete)\n"
+            "• <code>/toggleadmin</code> - Toggle whether admins are scanned (Default: False / Admins are scanned)\n"
+            "• <code>/free</code> (Owner/Anon Admin only) - Exempt trusted user or admin\n"
+            "• <code>/unfree</code> (Owner/Anon Admin only) - Remove exemption\n"
+            "• <code>/status</code> - View current configuration"
         )
         await bot.reply_to(message, welcome_text, parse_mode="HTML")
         return
@@ -389,37 +500,38 @@ async def cmd_start(message: types.Message):
     # Verify admin permissions
     is_admin = await is_user_admin(chat_id, user_id, message)
     if not is_admin:
-        await bot.reply_to(message, "⚠️ <i>Only group administrators can activate or configure this bot.</i>", parse_mode="HTML")
+        await bot.reply_to(message, "⚠️ <i>Only group administrators can configure this bot.</i>", parse_mode="HTML")
         return
 
-    # Initialize group configuration with default settings
-    existing_free_list = active_groups.get(chat_id, {}).get("free_list", set())
-    active_groups[chat_id] = {
-        "activated": True,
-        "action": "delete",        # Default action
-        "ignore_admins": True,     # Default: Skip admins
-        "free_list": existing_free_list
-    }
+    # Initialize / retrieve group configuration (ACTIVE BY DEFAULT)
+    group_config = get_group_config(chat_id)
+    group_config["activated"] = True
+    save_settings()
 
     # Invalidate cached admins to ensure fresh state
     admin_cache.pop(chat_id, None)
 
+    action = group_config.get("action", "delete")
+    ignore_admins = group_config.get("ignore_admins", False)
+    free_count = len(group_config.get("free_list", set()))
+
     activation_text = (
-        "🛡️ <b>BioLink Protection Activated!</b>\n\n"
-        "The bot is now actively monitoring incoming messages.\n\n"
+        "🛡️ <b>BioLink Protection is Active!</b>\n\n"
+        "All messages are actively filtered for promotional links, website domains, and connected channels.\n\n"
         "<b>Current Configuration:</b>\n"
-        "• <b>Status:</b> Active ✅\n"
-        "• <b>Action:</b> <code>delete</code> (Deletes messages from users with bio links)\n"
-        "• <b>Ignore Admins:</b> <code>True</code> (Group admins are exempt)\n"
-        "• <b>Exempt Users:</b> " + str(len(existing_free_list)) + "\n\n"
-        "<b>Admin Commands:</b>\n"
+        "• <b>Status:</b> Active ✅ (Default)\n"
+        f"• <b>Action:</b> <code>{action}</code>\n"
+        f"• <b>Filter Admins:</b> <code>{'Disabled (Admins exempt)' if ignore_admins else 'Enabled (Admins are scanned & deleted too)'}</code>\n"
+        f"• <b>Exempt Users (/free):</b> <code>{free_count}</code>\n\n"
+        "<b>Commands:</b>\n"
         "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code> - Change action\n"
-        "• <code>/toggleadmin</code> - Toggle whether admins are scanned\n"
-        "• <code>/free &lt;reply or @user&gt;</code> - Add user to exemption list\n"
-        "• <code>/status</code> - View current configuration"
+        "• <code>/toggleadmin</code> - Toggle admin filtering\n"
+        "• <code>/free &lt;reply or @user&gt;</code> - Exempt user (Owner/Anon Admin only)\n"
+        "• <code>/unfree &lt;reply or @user&gt;</code> - Remove exemption (Owner/Anon Admin only)\n"
+        "• <code>/status</code> - View group configuration"
     )
     await bot.reply_to(message, activation_text, parse_mode="HTML")
-    logger.info(f"Group {chat_id} ({chat.title}) activated by user {user_id}")
+    logger.info(f"Group {chat_id} ({chat.title}) verified by user {user_id}")
 
 
 @bot.message_handler(commands=["setaction"])
@@ -437,20 +549,17 @@ async def cmd_setaction(message: types.Message):
         await bot.reply_to(message, "⚠️ <i>Only administrators can configure this bot.</i>", parse_mode="HTML")
         return
 
-    if chat_id not in active_groups:
-        await bot.reply_to(message, "⚠️ Protection is not activated in this group yet. Please send <code>/start</code> first.", parse_mode="HTML")
-        return
-
+    group_config = get_group_config(chat_id)
     parts = message.text.strip().split()
     valid_actions = ["delete", "warn", "mute", "ban"]
 
     if len(parts) < 2 or parts[1].lower() not in valid_actions:
-        current_action = active_groups[chat_id].get("action", "delete")
+        current_action = group_config.get("action", "delete")
         help_text = (
             f"ℹ️ <b>Usage:</b> <code>/setaction &lt;delete|warn|mute|ban&gt;</code>\n\n"
             f"<b>Current Action:</b> <code>{current_action}</code>\n\n"
             f"<b>Options:</b>\n"
-            f"• <code>delete</code> - Silently deletes the violating message\n"
+            f"• <code>delete</code> - Silently deletes the violating message (Default)\n"
             f"• <code>warn</code> - Deletes message and sends a temporary warning in chat\n"
             f"• <code>mute</code> - Deletes message and restricts the user from sending messages\n"
             f"• <code>ban</code> - Deletes message and permanently bans the user"
@@ -459,7 +568,8 @@ async def cmd_setaction(message: types.Message):
         return
 
     new_action = parts[1].lower()
-    active_groups[chat_id]["action"] = new_action
+    group_config["action"] = new_action
+    save_settings()
 
     action_descriptions = {
         "delete": "Delete violating messages silently",
@@ -481,7 +591,7 @@ async def cmd_setaction(message: types.Message):
 async def cmd_toggleadmin(message: types.Message):
     """
     /toggleadmin: Toggles whether to skip checking admins (Admin Only).
-    Default is True (skip admins).
+    Default is False (admins are scanned and deleted too).
     """
     chat_id = message.chat.id
     if message.chat.type in ("private", "channel"):
@@ -493,27 +603,24 @@ async def cmd_toggleadmin(message: types.Message):
         await bot.reply_to(message, "⚠️ <i>Only administrators can configure this bot.</i>", parse_mode="HTML")
         return
 
-    if chat_id not in active_groups:
-        await bot.reply_to(message, "⚠️ Protection is not activated in this group yet. Please send <code>/start</code> first.", parse_mode="HTML")
-        return
-
-    # Toggle ignore_admins
-    current_state = active_groups[chat_id].get("ignore_admins", True)
+    group_config = get_group_config(chat_id)
+    current_state = group_config.get("ignore_admins", False)
     new_state = not current_state
-    active_groups[chat_id]["ignore_admins"] = new_state
+    group_config["ignore_admins"] = new_state
+    save_settings()
 
     # Invalidate admin cache to force re-check
     admin_cache.pop(chat_id, None)
 
     if new_state:
         status_msg = (
-            "🛡️ <b>Admin Exemption: ENABLED (Default)</b>\n\n"
-            "Group administrators and anonymous admins will <b>NOT</b> be scanned or restricted."
+            "🛡️ <b>Admin Filtering: DISABLED</b>\n\n"
+            "Group administrators will now be <b>exempted</b> from bio link checks."
         )
     else:
         status_msg = (
-            "⚠️ <b>Admin Exemption: DISABLED</b>\n\n"
-            "Group administrators will now also be scanned for bio links."
+            "⚠️ <b>Admin Filtering: ENABLED (Default)</b>\n\n"
+            "Messages from group administrators with links or connected channels in their profile will also be <b>deleted</b>."
         )
 
     await bot.reply_to(message, status_msg, parse_mode="HTML")
@@ -523,7 +630,8 @@ async def cmd_toggleadmin(message: types.Message):
 @bot.message_handler(commands=["free"])
 async def cmd_free(message: types.Message):
     """
-    /free: Exempts a user permanently from bio link checks (Admin Only).
+    /free: Exempts a user or admin permanently from bio link checks.
+    RESTRICTED TO: Group Owner (Creator) and Anonymous Admin ONLY.
     Usage:
     - Reply to a user's message with '/free'
     - Send '/free @username'
@@ -535,14 +643,17 @@ async def cmd_free(message: types.Message):
         return
 
     admin_user_id = message.from_user.id if message.from_user else 0
-    if not await is_user_admin(chat_id, admin_user_id, message):
-        await bot.reply_to(message, "⚠️ <i>Only administrators can use this command.</i>", parse_mode="HTML")
+
+    # Verification: Group Owner or Anonymous Admin ONLY
+    if not await is_owner_or_anonymous_admin(chat_id, admin_user_id, message):
+        await bot.reply_to(
+            message,
+            "⚠️ <i>Permission Denied: Only the <b>Group Owner</b> (Creator) or <b>Anonymous Admin</b> can exempt users.</i>",
+            parse_mode="HTML"
+        )
         return
 
-    if chat_id not in active_groups:
-        await bot.reply_to(message, "⚠️ Protection is not activated in this group yet. Please send <code>/start</code> first.", parse_mode="HTML")
-        return
-
+    group_config = get_group_config(chat_id)
     target_user_id: Optional[int] = None
     target_display: str = ""
 
@@ -591,38 +702,39 @@ async def cmd_free(message: types.Message):
     # If target could not be resolved
     if not target_user_id:
         usage_msg = (
-            "ℹ️ <b>How to Exempt a User:</b>\n\n"
+            "ℹ️ <b>How to Exempt a User or Admin:</b>\n\n"
             "1️⃣ <b>Reply to their message</b> with <code>/free</code>\n"
             "2️⃣ Or send: <code>/free @username</code>\n"
             "3️⃣ Or send: <code>/free &lt;user_id&gt;</code>\n\n"
-            "<i>Tip: If @username resolution fails, reply directly to their message!</i>"
+            "<i>(Only the Group Owner and Anonymous Admin can execute this)</i>"
         )
         await bot.reply_to(message, usage_msg, parse_mode="HTML")
         return
 
     # Add to free_list
-    group_config = active_groups[chat_id]
     if "free_list" not in group_config:
         group_config["free_list"] = set()
 
     group_config["free_list"].add(target_user_id)
+    save_settings()
 
     # Remove any cached bio flag to ensure instant clearance
     bio_cache.pop(target_user_id, None)
 
     success_msg = (
-        f"✅ <b>User Exempted!</b>\n\n"
+        f"✅ <b>Exemption Granted!</b>\n\n"
         f"{target_display} has been added to this group's exemption list.\n"
-        f"<i>All bio link scans will be bypassed permanently for this user in this group.</i>"
+        f"<i>All bio and connected channel checks will be bypassed permanently for this person.</i>"
     )
     await bot.reply_to(message, success_msg, parse_mode="HTML")
-    logger.info(f"User {target_user_id} added to free_list in chat {chat_id} by admin {admin_user_id}")
+    logger.info(f"User/Admin {target_user_id} added to free_list in chat {chat_id} by owner/anon {admin_user_id}")
 
 
 @bot.message_handler(commands=["unfree"])
 async def cmd_unfree(message: types.Message):
     """
-    /unfree: Removes a user from the chat's exemption list (Admin Only).
+    /unfree: Removes a user or admin from the chat's exemption list.
+    RESTRICTED TO: Group Owner (Creator) and Anonymous Admin ONLY.
     """
     chat_id = message.chat.id
     if message.chat.type in ("private", "channel"):
@@ -630,14 +742,17 @@ async def cmd_unfree(message: types.Message):
         return
 
     admin_user_id = message.from_user.id if message.from_user else 0
-    if not await is_user_admin(chat_id, admin_user_id, message):
-        await bot.reply_to(message, "⚠️ <i>Only administrators can use this command.</i>", parse_mode="HTML")
+
+    # Verification: Group Owner or Anonymous Admin ONLY
+    if not await is_owner_or_anonymous_admin(chat_id, admin_user_id, message):
+        await bot.reply_to(
+            message,
+            "⚠️ <i>Permission Denied: Only the <b>Group Owner</b> (Creator) or <b>Anonymous Admin</b> can use this command.</i>",
+            parse_mode="HTML"
+        )
         return
 
-    if chat_id not in active_groups:
-        await bot.reply_to(message, "⚠️ Protection is not activated in this group yet.", parse_mode="HTML")
-        return
-
+    group_config = get_group_config(chat_id)
     target_user_id: Optional[int] = None
 
     if message.reply_to_message and message.reply_to_message.from_user:
@@ -656,10 +771,10 @@ async def cmd_unfree(message: types.Message):
         await bot.reply_to(message, "ℹ️ <b>Usage:</b> Reply to user with <code>/unfree</code> or send <code>/unfree &lt;id|@username&gt;</code>", parse_mode="HTML")
         return
 
-    free_list = active_groups[chat_id].get("free_list", set())
+    free_list = group_config.get("free_list", set())
     if target_user_id in free_list:
         free_list.discard(target_user_id)
-        # Clear bio cache so they will be scanned freshly on next message
+        save_settings()
         bio_cache.pop(target_user_id, None)
         await bot.reply_to(message, f"✅ User <code>{target_user_id}</code> removed from exemption list.", parse_mode="HTML")
     else:
@@ -681,30 +796,22 @@ async def cmd_status(message: types.Message):
         await bot.reply_to(message, "⚠️ <i>Only administrators can view bot status.</i>", parse_mode="HTML")
         return
 
-    config = active_groups.get(chat_id)
-    if not config or not config.get("activated", False):
-        status_text = (
-            "⚙️ <b>Bot Status: PASSIVE (Disabled)</b>\n\n"
-            "The bot is currently idle and not scanning messages in this group.\n"
-            "An administrator can activate it by sending <code>/start</code>."
-        )
-    else:
-        action = config.get("action", "delete")
-        ignore_admins = config.get("ignore_admins", True)
-        exempt_count = len(config.get("free_list", set()))
+    config = get_group_config(chat_id)
+    action = config.get("action", "delete")
+    ignore_admins = config.get("ignore_admins", False)
+    exempt_count = len(config.get("free_list", set()))
 
-        status_text = (
-            "⚙️ <b>BioLink Protection: ACTIVE ✅</b>\n\n"
-            f"• <b>Configured Action:</b> <code>{action}</code>\n"
-            f"• <b>Skip Admins:</b> <code>{'Yes' if ignore_admins else 'No'}</code>\n"
-            f"• <b>Exempt Users (/free):</b> <code>{exempt_count}</code>\n\n"
-            "<b>Controls:</b>\n"
-            "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code>\n"
-            "• <code>/toggleadmin</code>\n"
-            "• <code>/free &lt;reply or @username&gt;</code>\n"
-            "• <code>/unfree &lt;reply or @username&gt;</code>"
-        )
-
+    status_text = (
+        "⚙️ <b>BioLink Protection: ACTIVE ✅ (Default)</b>\n\n"
+        f"• <b>Configured Action:</b> <code>{action}</code> (Deletes violating messages)\n"
+        f"• <b>Filter Admins:</b> <code>{'Disabled (Admins exempt)' if ignore_admins else 'Enabled (Admins are scanned & deleted too)'}</code>\n"
+        f"• <b>Exempt Users (/free):</b> <code>{exempt_count}</code>\n\n"
+        "<b>Admin Controls:</b>\n"
+        "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code>\n"
+        "• <code>/toggleadmin</code>\n"
+        "• <code>/free &lt;reply or @user&gt;</code> (Owner/Anon Admin only)\n"
+        "• <code>/unfree &lt;reply or @user&gt;</code> (Owner/Anon Admin only)"
+    )
     await bot.reply_to(message, status_text, parse_mode="HTML")
 
 
@@ -715,18 +822,17 @@ async def cmd_help(message: types.Message):
     """
     help_text = (
         "📖 <b>BioLink Channel Restrictor - Help Guide</b>\n\n"
+        "<b>Default Behavior:</b>\n"
+        "• Active automatically in all groups without needing /start.\n"
+        "• Automatically deletes messages from members AND admins who have promotional links, website domains, @channel handles, or connected channels in their profile.\n\n"
         "<b>Administrator Commands:</b>\n"
-        "• <code>/start</code> - Activate bio link scanning in this group\n"
-        "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code> - Configure punishment\n"
-        "• <code>/toggleadmin</code> - Toggle skipping admins (Default: True)\n"
-        "• <code>/free</code> - Exempt a user (by reply or @username)\n"
-        "• <code>/unfree</code> - Remove exemption from a user\n"
-        "• <code>/status</code> - View current configuration & health\n"
-        "• <code>/help</code> - Show this documentation\n\n"
-        "<b>How it Works:</b>\n"
-        "When an active member sends any message, the bot inspects their profile bio. "
-        "If a URL link, website domain, or Telegram channel username is found, "
-        "the configured group action is executed immediately."
+        "• <code>/start</code> - Check status & confirm active protection\n"
+        "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code> - Configure punishment (Default: delete)\n"
+        "• <code>/toggleadmin</code> - Toggle whether admins are scanned (Default: False / admins are scanned)\n"
+        "• <code>/free</code> - Exempt a user/admin (Owner or Anonymous Admin only)\n"
+        "• <code>/unfree</code> - Remove exemption (Owner or Anonymous Admin only)\n"
+        "• <code>/status</code> - View current configuration & stats\n"
+        "• <code>/help</code> - Show this documentation"
     )
     await bot.reply_to(message, help_text, parse_mode="HTML")
 
@@ -756,17 +862,14 @@ async def process_chat_message(message: types.Message):
 
     chat_id = message.chat.id
 
-    # Filter 0b: Check if group has been activated by an admin
-    group_config = active_groups.get(chat_id)
-    if not group_config or not group_config.get("activated", False):
-        # Default State: Passive, do not delete or process anything
+    # Filter 0b: Retrieve group configuration (ACTIVE BY DEFAULT ACROSS ALL GROUPS)
+    group_config = get_group_config(chat_id)
+    if not group_config.get("activated", True):
         return
 
     # Track username to user_id mapping dynamically for /free lookup
     if message.from_user and message.from_user.username:
         username_to_id[message.from_user.username.lower()] = message.from_user.id
-
-    ignore_admins = group_config.get("ignore_admins", True)
 
     # Check for Anonymous Admin (posted as chat channel or via AnonymousBot)
     is_anon_admin = bool(
@@ -774,10 +877,8 @@ async def process_chat_message(message: types.Message):
         (message.from_user and message.from_user.id == ANONYMOUS_ADMIN_USER_ID)
     )
 
+    # Anonymous admin messages sent as the group itself have no personal profile/bio
     if is_anon_admin:
-        if ignore_admins:
-            return
-        # If ignore_admins is False, anonymous admins have no personal bio to scan
         return
 
     # If sender is missing or is an automated bot/service, skip
@@ -786,25 +887,25 @@ async def process_chat_message(message: types.Message):
 
     user_id = message.from_user.id
 
-    # Fast Check 1: If user is an Admin and ignore_admins is enabled, skip immediately
-    if ignore_admins:
-        if await is_user_admin(chat_id, user_id, message):
-            return
-
-    # Fast Check 2: If user is on this chat's free_list, skip immediately
+    # Fast Check 1: Exemption List (/free) - Bypasses all checks for exempted users/admins
     free_list: Set[int] = group_config.get("free_list", set())
     if user_id in free_list:
         return
 
-    # Bio Scan: Asynchronously inspect user profile bio
-    has_violating_link = await scan_user_bio(user_id)
-    if not has_violating_link:
+    # Fast Check 2: Skip admins ONLY IF ignore_admins is True (Default: False / Admins are scanned)
+    if group_config.get("ignore_admins", False):
+        if await is_user_admin(chat_id, user_id, message):
+            return
+
+    # Bio & Connected Channel Scan
+    has_violation, reason = await scan_user_bio(user_id)
+    if not has_violation:
         return
 
-    # Action Trigger: User has violating link in bio!
+    # Action Trigger: User or Admin has a link, handle, or connected channel!
     configured_action = group_config.get("action", "delete")
     # Offload action execution asynchronously so the event loop returns in microseconds
-    asyncio.create_task(execute_action(message, configured_action))
+    asyncio.create_task(execute_action(message, configured_action, reason))
 
 
 # ------------------------------------------------------------------------------
