@@ -625,85 +625,241 @@ async def get_admin_managed_groups(user_id: int) -> List[Tuple[int, str, Dict[st
     return managed
 
 
-async def render_groups_list(user: types.User) -> Tuple[str, types.InlineKeyboardMarkup]:
+def render_welcome_screen(user: types.User) -> Tuple[str, types.InlineKeyboardMarkup]:
     """
-    Builds the Group Help-style groups list message and inline keyboard in private chat.
+    Renders Screen 1 (Image 2): Group Help style Welcome Screen in Private DM.
     """
     first_name = html.escape(user.first_name or "Admin")
     bot_uname = bot_metadata.get("username") or "bioLinkChannelBot"
+
+    text = (
+        "👋 <b>Hello!</b>\n"
+        "<b>BioLink Restrictor</b> is the most complete Bot to help you manage your groups easily and safely!\n\n"
+        "👉 <b>Add me in a Supergroup and promote me as Admin to let me get in action!</b>\n\n"
+        "🔻 <b>WHICH ARE THE COMMANDS?</b> 🔻\n"
+        "Press /help to see all the commands and how they work!\n"
+        "📑 <i>Default protection is active automatically across all connected groups.</i>"
+    )
+
+    markup = types.InlineKeyboardMarkup(row_width=2)
+    markup.add(
+        types.InlineKeyboardButton("➕ Add me to a Group ➕", url=f"https://t.me/{bot_uname}?startgroup=true")
+    )
+    markup.add(
+        types.InlineKeyboardButton("⚙️ Manage group Settings ✍️", callback_data="mng_groups")
+    )
+    markup.row(
+        types.InlineKeyboardButton("👥 Support / Approval ↗", url="https://t.me/i_am_turtle"),
+        types.InlineKeyboardButton("ℹ️ Information 💬", callback_data="info_bot")
+    )
+    markup.add(
+        types.InlineKeyboardButton("📖 Commands Guide", callback_data="view_commands")
+    )
+    return text, markup
+
+
+async def render_groups_selector(user: types.User) -> Tuple[str, types.InlineKeyboardMarkup]:
+    """
+    Renders Screen 2 (Image 3): Manage group Settings - Group Selection List.
+    """
+    bot_uname = bot_metadata.get("username") or "bioLinkChannelBot"
     managed = await get_admin_managed_groups(user.id)
-    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    markup = types.InlineKeyboardMarkup(row_width=1)
 
     if not managed:
         text = (
-            f"👋 <b>Hello, {first_name}!</b>\n\n"
-            f"You are not currently registered as an administrator in any connected groups.\n\n"
-            f"<b>How to connect your group:</b>\n"
-            f"1️⃣ Add @{bot_uname} to your Telegram group.\n"
-            f"2️⃣ Promote the bot to <b>Administrator</b> with permission to <i>Delete Messages</i>.\n"
-            f"3️⃣ The group will automatically appear here for you to manage!"
+            "<b>Manage group Settings</b>\n"
+            "👉 <u>Select the group</u> whose settings you want to change.\n\n"
+            "⚠️ <i>You are not currently detected as an administrator in any connected groups.</i>\n\n"
+            "If a group in which you are an administrator doesn't appear here:\n"
+            "• Send /reload in the group and try again\n"
+            "• Send /settings in the group and then press \"Open in pvt\""
         )
-        keyboard.add(
-            types.InlineKeyboardButton("➕ Add Bot to Group", url=f"https://t.me/{bot_uname}?startgroup=true"),
-            types.InlineKeyboardButton("🔄 Refresh List", callback_data="refresh_groups")
+        markup.add(
+            types.InlineKeyboardButton("➕ Add me to a Group ➕", url=f"https://t.me/{bot_uname}?startgroup=true"),
+            types.InlineKeyboardButton("🔄 Refresh List", callback_data="mng_groups"),
+            types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_main")
         )
-        return text, keyboard
+        return text, markup
 
     text = (
-        f"👋 <b>Hello, {first_name}!</b>\n\n"
-        f"Here are the groups you manage that are connected to <b>BioLink Restrictor</b>:\n"
-        f"<i>Select a group below to view its live status and protection settings:</i>"
+        "<b>Manage group Settings</b>\n"
+        "👉 <u>Select the group</u> whose settings you want to change.\n\n"
+        "If a group in which you are an administrator doesn't appear here:\n"
+        "• Send /reload in the group and try again\n"
+        "• Send /settings in the group and then press \"Open in pvt\""
     )
 
     for chat_id, title, config in managed:
-        act_status = "✅ Active" if config.get("activated", True) else "⏸️ Paused"
-        button_label = f"👥 {title} ({act_status})"
-        keyboard.add(types.InlineKeyboardButton(button_label, callback_data=f"grp_{chat_id}"))
+        markup.add(types.InlineKeyboardButton(f"👥 {title}", callback_data=f"grp_{chat_id}"))
 
-    keyboard.add(
-        types.InlineKeyboardButton("➕ Add to Another Group", url=f"https://t.me/{bot_uname}?startgroup=true"),
-        types.InlineKeyboardButton("🔄 Refresh List", callback_data="refresh_groups")
+    markup.add(
+        types.InlineKeyboardButton("🔄 Refresh List", callback_data="mng_groups"),
+        types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_main")
     )
-    return text, keyboard
+    return text, markup
 
 
-async def render_single_group_dashboard(chat_id: int, user_id: int) -> Tuple[str, types.InlineKeyboardMarkup]:
+def render_group_settings_grid(chat_id: int) -> Tuple[str, types.InlineKeyboardMarkup]:
     """
-    Builds the detailed dashboard for a single group selected by the admin in private chat.
+    Renders Screen 3 (Images 1 & 4): The exact SETTINGS Grid for the selected group.
     """
     config = get_group_config(chat_id)
     title = config.get("title") or f"Group {chat_id}"
     action = config.get("action", "delete")
     ignore_admins = config.get("ignore_admins", False)
     bio_exempt_count = len(config.get("free_list", set()))
-    link_allowed_count = len(config.get("free_links", set()))
-    has_custom = "Customized ✅" if config.get("custom_bio_msg") else "Default (@i_am_turtle) ℹ️"
+    link_count = len(config.get("free_links", set()))
 
     text = (
-        f"🛡️ <b>Group Dashboard: {html.escape(title)}</b>\n"
-        f"<code>ID: {chat_id}</code>\n\n"
-        f"• <b>Status:</b> <code>Active ✅ (Default)</code>\n"
-        f"• <b>Punishment Action:</b> <code>{action}</code>\n"
-        f"• <b>Filter Admins:</b> <code>{'Disabled (Admins exempt)' if ignore_admins else 'Enabled (Admins scanned too)'}</code>\n"
-        f"• <b>Bio Exempt Users (/free):</b> <code>{bio_exempt_count}</code>\n"
-        f"• <b>Link Allowed Users (/free link):</b> <code>{link_allowed_count}</code>\n"
-        f"• <b>Bio Deletion Notice:</b> <code>{has_custom}</code>\n\n"
-        f"⚙️ <b>Commands to use in the group:</b>\n"
-        f"• <code>/free &lt;user&gt;</code> - Exempt member from bio checks\n"
-        f"• <code>/free link &lt;user&gt;</code> - Permit member to send links\n"
-        f"• <code>/unfree &lt;user&gt;</code> - Revoke bio exemption\n"
-        f"• <code>/unfree link &lt;user&gt;</code> - Revoke link permission\n"
-        f"• <code>/setmsg &lt;text&gt;</code> - Customize bio notice\n"
-        f"• <code>/setaction &lt;delete|warn|mute|ban&gt;</code>\n"
-        f"• <code>/toggleadmin</code> - Toggle admin filtering"
+        "<b>SETTINGS</b>\n"
+        f"<b>Group:</b> {html.escape(title)}\n\n"
+        "<i>Select one of the settings that you want to change.</i>"
     )
 
-    keyboard = types.InlineKeyboardMarkup(row_width=1)
-    keyboard.add(
-        types.InlineKeyboardButton("🔄 Refresh Settings", callback_data=f"grp_{chat_id}"),
-        types.InlineKeyboardButton("⬅️ Back to Groups List", callback_data="back_groups")
-    )
-    return text, keyboard
+    markup = types.InlineKeyboardMarkup(row_width=2)
+
+    # Row 1: Bio & Channel restriction | In-Chat Links restriction
+    btn_bio = types.InlineKeyboardButton("📜 Bio & Channel", callback_data=f"sub_bio_{chat_id}")
+    btn_chat_links = types.InlineKeyboardButton("📨 In-Chat Links", callback_data=f"sub_links_{chat_id}")
+    markup.row(btn_bio, btn_chat_links)
+
+    # Row 2: Punishment action cycler | Admin filter toggle
+    btn_action = types.InlineKeyboardButton(f"⚖️ Action: {action.capitalize()}", callback_data=f"cycle_act_{chat_id}")
+    admin_label = "🛡️ Admins: Filter ON" if not ignore_admins else "🛡️ Admins: Exempt"
+    btn_admins = types.InlineKeyboardButton(admin_label, callback_data=f"toggle_adm_{chat_id}")
+    markup.row(btn_action, btn_admins)
+
+    # Row 3: Bio Exempt count | Link Allowed count
+    btn_free = types.InlineKeyboardButton(f"👥 Bio Exempt ({bio_exempt_count})", callback_data=f"sub_free_{chat_id}")
+    btn_free_links = types.InlineKeyboardButton(f"🔗 Link Allowed ({link_count})", callback_data=f"sub_freel_{chat_id}")
+    markup.row(btn_free, btn_free_links)
+
+    # Row 4: Bio notice message | Deleting messages info
+    btn_notice = types.InlineKeyboardButton("📢 30s Notice Msg", callback_data=f"sub_notice_{chat_id}")
+    btn_delmsg = types.InlineKeyboardButton("🗑 Deleting Messages", callback_data=f"sub_delmsg_{chat_id}")
+    markup.row(btn_notice, btn_delmsg)
+
+    # Row 5: Anti-Promotion | Approval Mode
+    btn_antipromo = types.InlineKeyboardButton("🕵️‍♂️ Anti-Promotion", callback_data=f"sub_promo_{chat_id}")
+    btn_support = types.InlineKeyboardButton("🎛 Approval Mode", callback_data=f"sub_apprv_{chat_id}")
+    markup.row(btn_antipromo, btn_support)
+
+    # Bottom Row: Back | Close | Reload (matching Images 1 & 4 bottom bar)
+    btn_back = types.InlineKeyboardButton("⬅️ Back", callback_data="mng_groups")
+    btn_close = types.InlineKeyboardButton("✅ Close", callback_data="close_pvt")
+    btn_reload = types.InlineKeyboardButton("🔄 Reload", callback_data=f"grp_{chat_id}")
+    markup.row(btn_back, btn_close, btn_reload)
+
+    return text, markup
+
+
+def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.InlineKeyboardMarkup]:
+    """
+    Renders detailed sub-views when a specific setting button in the grid is clicked.
+    """
+    config = get_group_config(chat_id)
+    title = config.get("title") or f"Group {chat_id}"
+    markup = types.InlineKeyboardMarkup(row_width=1)
+    markup.add(types.InlineKeyboardButton("⬅️ Back to Settings", callback_data=f"grp_{chat_id}"))
+
+    if sub_type == "bio":
+        text = (
+            f"📜 <b>Bio & Connected Channel Scanner</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"• <b>Status:</b> <code>Active ✅ (Default)</code>\n"
+            f"• <b>Connected Channels:</b> Scans Telegram <code>personal_chat</code> on user profiles.\n"
+            f"• <b>Profile Bios:</b> Scans for URLs, website links, and @channel handles.\n"
+            f"• <b>Action:</b> Violating messages are deleted immediately + a 30s notice is sent.\n\n"
+            f"<i>Admins and members with bio links are blocked unless exempted with /free.</i>"
+        )
+    elif sub_type == "links":
+        text = (
+            f"📨 <b>In-Chat Links & Forwards Filter</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"• <b>Status:</b> <code>Active ✅ (Default)</code>\n"
+            f"• <b>Prohibited Content:</b> Web links, inline links, forwarded messages from {{users, bots, channels, groups}}, and external bot mentions.\n"
+            f"• <b>Action:</b> Silently deleted immediately with ZERO spam notification.\n\n"
+            f"<i>Only users granted permission with /free link or the Group Owner can send links.</i>"
+        )
+    elif sub_type == "free":
+        free_list = config.get("free_list", set())
+        users_str = ", ".join(f"<code>{uid}</code>" for uid in list(free_list)[:15]) or "<i>None</i>"
+        text = (
+            f"👥 <b>Bio Exempt Users (/free)</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"• <b>Total Exempt:</b> <code>{len(free_list)}</code>\n"
+            f"• <b>Exempt User IDs:</b> {users_str}\n\n"
+            f"<b>Commands:</b>\n"
+            f"• <code>/free &lt;reply or @user&gt;</code> - Exempt member from bio scans\n"
+            f"• <code>/unfree &lt;reply or @user&gt;</code> - Revoke bio exemption\n\n"
+            f"<i>(Only the Group Owner and Anonymous Admin can exempt users)</i>"
+        )
+    elif sub_type == "freel":
+        free_links = config.get("free_links", set())
+        users_str = ", ".join(f"<code>{uid}</code>" for uid in list(free_links)[:15]) or "<i>None</i>"
+        text = (
+            f"🔗 <b>Link Allowed Users (/free link)</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"• <b>Total Authorized:</b> <code>{len(free_links)}</code>\n"
+            f"• <b>Authorized User IDs:</b> {users_str}\n\n"
+            f"<b>Commands:</b>\n"
+            f"• <code>/free link &lt;reply or @user&gt;</code> - Allow user to send in-chat links\n"
+            f"• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link permission\n\n"
+            f"<i>(Only the Group Owner and Anonymous Admin can manage link permissions)</i>"
+        )
+    elif sub_type == "notice":
+        custom_msg = config.get("custom_bio_msg")
+        status_label = "Custom" if custom_msg else "Default (@i_am_turtle)"
+        current_text = custom_msg or DEFAULT_BIO_DELETE_MSG
+        text = (
+            f"📢 <b>Bio Deletion Notice ({status_label})</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"<b>Current Active Notice:</b>\n"
+            f"{html.escape(current_text)}\n\n"
+            f"• <b>Auto-Delete Timer:</b> 30 seconds\n\n"
+            f"<b>Commands to customize:</b>\n"
+            f"• <code>/setmsg &lt;your message&gt;</code> - Set custom message\n"
+            f"• <code>/resetmsg</code> - Reset back to default"
+        )
+    elif sub_type == "delmsg":
+        text = (
+            f"🗑 <b>Deleting Messages Engine</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"• <b>Admin / Owner Commands:</b> Auto-deleted within 3 seconds to keep chat clean.\n"
+            f"• <b>Bot Command Replies:</b> Auto-deleted within 15–25 seconds.\n"
+            f"• <b>Bio Violation Notice:</b> Auto-deleted after 30 seconds.\n"
+            f"• <b>In-Chat Link Violations:</b> Silently deleted in 0.1–0.3 seconds with no notification."
+        )
+    elif sub_type == "promo":
+        text = (
+            f"🕵️‍♂️ <b>Anti-Promotion Shield</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"Zero-tolerance protection against self-promoters and advertisement bots:\n"
+            f"• Detects link shorteners (bit.ly, t.me, linktr.ee, bio.link, etc.).\n"
+            f"• Detects connected channel profiles and external business intros.\n"
+            f"• Instant sub-millisecond RAM matching."
+        )
+    elif sub_type == "apprv":
+        text = (
+            f"🎛 <b>Approval Mode & Support</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"Whenever a member with a bio link has their message deleted, the bot instructs them to contact <b>@i_am_turtle</b> for approval.\n\n"
+            f"The Group Owner or Anonymous Admin can approve them with <code>/free</code>."
+        )
+    else:
+        text = f"<b>Settings:</b> {html.escape(title)}"
+
+    return text, markup
+
+
+# Backward compatibility aliases for dashboard rendering
+render_groups_list = render_groups_selector
+
+
+async def render_single_group_dashboard(chat_id: int, user_id: int = 0) -> Tuple[str, types.InlineKeyboardMarkup]:
+    """Backward compatibility alias for rendering single group settings grid."""
+    return render_group_settings_grid(chat_id)
 
 
 # ------------------------------------------------------------------------------
@@ -720,59 +876,191 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
     data = call.data
     user = call.from_user
 
-    if data in ("refresh_groups", "back_groups"):
-        text, keyboard = await render_groups_list(user)
+    # 1. Main Welcome Screen
+    if data == "back_main":
+        text, markup = render_welcome_screen(user)
         try:
-            await bot.edit_message_text(
-                text,
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
         except Exception:
             pass
         await bot.answer_callback_query(call.id)
         return
 
+    # 2. Manage group Settings (Image 3)
+    if data in ("mng_groups", "refresh_groups", "back_groups"):
+        text, markup = await render_groups_selector(user)
+        try:
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        await bot.answer_callback_query(call.id)
+        return
+
+    # 3. Close panel
+    if data == "close_pvt":
+        try:
+            await bot.delete_message(call.message.chat.id, call.message.message_id)
+        except Exception:
+            pass
+        await bot.answer_callback_query(call.id, "Closed")
+        return
+
+    # 4. Bot Information
+    if data == "info_bot":
+        uptime_seconds = int(time.time() - START_TIME)
+        human_uptime = get_human_uptime(uptime_seconds)
+        info_text = (
+            f"ℹ️ <b>BioLink Restrictor Bot Information</b>\n\n"
+            f"• <b>Status:</b> <code>Online ✅</code>\n"
+            f"• <b>Uptime:</b> <code>{human_uptime}</code>\n"
+            f"• <b>Active Groups:</b> <code>{len(active_groups)}</code>\n"
+            f"• <b>Cached User Bios:</b> <code>{len(bio_cache)}</code>\n"
+            f"• <b>Engine:</b> <code>AsyncTeleBot & aiohttp</code>\n\n"
+            f"Developed for high-performance zero-delay moderation."
+        )
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_main"))
+        try:
+            await bot.edit_message_text(info_text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        await bot.answer_callback_query(call.id)
+        return
+
+    # 5. Commands Guide
+    if data == "view_commands":
+        guide_text = (
+            "📖 <b>BioLink Restrictor - Command Catalog</b>\n\n"
+            "• <code>/start</code> - Open setup & group management\n"
+            "• <code>/settings</code> - Open settings (or Open in pvt)\n"
+            "• <code>/reload</code> - Reload group admin list & title\n"
+            "• <code>/free &lt;user&gt;</code> - Exempt bio links (Owner/Anon Admin only)\n"
+            "• <code>/free link &lt;user&gt;</code> - Permit sending links (Owner/Anon Admin only)\n"
+            "• <code>/unfree &lt;user&gt;</code> - Revoke bio exemption\n"
+            "• <code>/unfree link &lt;user&gt;</code> - Revoke link permission\n"
+            "• <code>/setmsg &lt;text&gt;</code> - Customize 30s bio deletion notice\n"
+            "• <code>/resetmsg</code> - Reset bio notice to default\n"
+            "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code>\n"
+            "• <code>/toggleadmin</code> - Toggle admin filtering"
+        )
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("⬅️ Back to Menu", callback_data="back_main"))
+        try:
+            await bot.edit_message_text(guide_text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+        except Exception:
+            pass
+        await bot.answer_callback_query(call.id)
+        return
+
+    # 6. Single Group Settings Grid (Image 1 & 4)
     if data.startswith("grp_"):
         try:
             chat_id = int(data.split("_")[1])
-            # Security verification: ensure user is an admin/owner of this group
             if not await is_user_admin(chat_id, user.id):
-                await bot.answer_callback_query(
-                    call.id,
-                    "⚠️ You are no longer an administrator in this group.",
-                    show_alert=True
-                )
+                await bot.answer_callback_query(call.id, "⚠️ You are no longer an administrator in this group.", show_alert=True)
                 return
 
-            text, keyboard = await render_single_group_dashboard(chat_id, user.id)
-            await bot.edit_message_text(
-                text,
-                chat_id=call.message.chat.id,
-                message_id=call.message.message_id,
-                parse_mode="HTML",
-                reply_markup=keyboard
-            )
+            text, markup = render_group_settings_grid(chat_id)
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
             await bot.answer_callback_query(call.id)
         except Exception as e:
             logger.error(f"Error handling group callback {data}: {e}")
             await bot.answer_callback_query(call.id, "Error loading group settings.")
+        return
+
+    # 7. Action Cycle Button (delete -> warn -> mute -> ban -> delete)
+    if data.startswith("cycle_act_"):
+        try:
+            chat_id = int(data.split("_")[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            config = get_group_config(chat_id)
+            actions = ["delete", "warn", "mute", "ban"]
+            curr_action = config.get("action", "delete")
+            next_action = actions[(actions.index(curr_action) + 1) % len(actions)]
+            config["action"] = next_action
+            save_settings()
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, action=next_action))
+
+            text, markup = render_group_settings_grid(chat_id)
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            await bot.answer_callback_query(call.id, f"Action: {next_action.capitalize()}")
+        except Exception as e:
+            logger.error(f"Error cycling action: {e}")
+            await bot.answer_callback_query(call.id, "Could not update action.")
+        return
+
+    # 8. Admin Filter Toggle Button
+    if data.startswith("toggle_adm_"):
+        try:
+            chat_id = int(data.split("_")[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            config = get_group_config(chat_id)
+            new_state = not config.get("ignore_admins", False)
+            config["ignore_admins"] = new_state
+            save_settings()
+            admin_cache.pop(chat_id, None)
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, ignore_admins=new_state))
+
+            text, markup = render_group_settings_grid(chat_id)
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            notice = "Admins will be EXEMPT" if new_state else "Admins will be SCANNED and deleted"
+            await bot.answer_callback_query(call.id, notice)
+        except Exception as e:
+            logger.error(f"Error toggling admin filter: {e}")
+            await bot.answer_callback_query(call.id, "Could not toggle admin setting.")
+        return
+
+    # 9. Sub-setting Views (sub_bio, sub_links, sub_free, sub_freel, sub_notice, sub_delmsg, sub_promo, sub_apprv)
+    if data.startswith("sub_"):
+        try:
+            parts = data.split("_")
+            sub_type = parts[1]
+            chat_id = int(parts[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            text, markup = render_sub_setting(chat_id, sub_type)
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            await bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error rendering sub setting {data}: {e}")
+            await bot.answer_callback_query(call.id, "Could not load setting.")
+        return
 
 
 @bot.message_handler(commands=["start", "groups", "chats"])
 async def cmd_start(message: types.Message):
     """
-    /start: Displays Group Help-style interactive dashboard in private DM,
-    or group status in supergroups.
+    /start: Displays Group Help-style Welcome Screen or Group Settings in private DM,
+    or confirms status in supergroups.
     """
     chat = message.chat
 
     # Case 1: Private DM with user / admin / owner
     if chat.type == "private":
-        text, keyboard = await render_groups_list(message.from_user)
-        await bot.send_message(chat.id, text, parse_mode="HTML", reply_markup=keyboard)
+        parts = message.text.strip().split()
+        if len(parts) >= 2 and parts[1].startswith("settings_"):
+            try:
+                target_chat_id = int(parts[1][len("settings_"):])
+                if await is_user_admin(target_chat_id, message.from_user.id):
+                    text, markup = render_group_settings_grid(target_chat_id)
+                    await bot.send_message(chat.id, text, parse_mode="HTML", reply_markup=markup)
+                    return
+            except Exception as e:
+                logger.error(f"Error opening settings from deep link: {e}")
+
+        # Default Welcome Screen (Image 2)
+        text, markup = render_welcome_screen(message.from_user)
+        await bot.send_message(chat.id, text, parse_mode="HTML", reply_markup=markup)
         return
 
     # Case 2: Group / Supergroup
@@ -1329,7 +1617,93 @@ async def cmd_getmsg(message: types.Message):
     asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 25))
 
 
-@bot.message_handler(commands=["status", "settings"])
+@bot.message_handler(commands=["settings"])
+async def cmd_settings(message: types.Message):
+    """
+    /settings: Group Help style settings command.
+    - In group: replies with an inline button [ ⚙️ Open in pvt ↗ ] linking to private DM settings.
+    - In private: opens the group selector list directly.
+    """
+    chat = message.chat
+    if chat.type == "private":
+        text, markup = await render_groups_selector(message.from_user)
+        await bot.send_message(chat.id, text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    schedule_command_cleanup(message, delay=3)
+    user_id = message.from_user.id if message.from_user else 0
+
+    if not await is_user_admin(chat.id, user_id, message):
+        err = await bot.reply_to(message, "⚠️ <i>Only administrators can open group settings.</i>", parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat.id, err.message_id, 10))
+        return
+
+    bot_uname = bot_metadata.get("username") or "bioLinkChannelBot"
+    settings_url = f"https://t.me/{bot_uname}?start=settings_{chat.id}"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("⚙️ Open in pvt ↗", url=settings_url))
+
+    title = chat.title or "this group"
+    reply = await bot.reply_to(
+        message,
+        f"⚙️ <b>Settings for {html.escape(title)}</b>\n\n"
+        f"👉 Press the button below to configure the settings of this group in private:",
+        parse_mode="HTML",
+        reply_markup=markup
+    )
+    asyncio.create_task(auto_delete_message(chat.id, reply.message_id, 30))
+
+
+@bot.message_handler(commands=["reload"])
+async def cmd_reload(message: types.Message):
+    """
+    /reload: Refreshes group title, active configuration, and administrator list cache.
+    Matches Group Help's /reload command.
+    """
+    chat = message.chat
+    if chat.type == "private":
+        text, markup = await render_groups_selector(message.from_user)
+        await bot.send_message(chat.id, text, parse_mode="HTML", reply_markup=markup)
+        return
+
+    schedule_command_cleanup(message, delay=3)
+    user_id = message.from_user.id if message.from_user else 0
+
+    if not await is_user_admin(chat.id, user_id, message):
+        err = await bot.reply_to(message, "⚠️ <i>Only administrators can reload group cache.</i>", parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat.id, err.message_id, 10))
+        return
+
+    # Invalidate cached admins to force fresh fetch
+    admin_cache.pop(chat.id, None)
+
+    # Update title in active_groups
+    config = get_group_config(chat.id)
+    if chat.title:
+        config["title"] = chat.title
+    save_settings()
+
+    # Pre-warm admin cache with fresh API call
+    try:
+        admins = await bot.get_chat_administrators(chat.id)
+        admin_ids = {m.user.id for m in admins}
+        admin_cache[chat.id] = (admin_ids, time.monotonic() + ADMIN_CACHE_TTL)
+        if db_manager.is_connected:
+            asyncio.create_task(db_manager.upsert_group(chat_id=chat.id, title=chat.title or ""))
+    except Exception as e:
+        logger.warning(f"Could not refresh administrators for chat {chat.id}: {e}")
+
+    reply = await bot.reply_to(
+        message,
+        "🔄 <b>Group Data Reloaded!</b>\n\n"
+        "• The administrator list and group title have been successfully refreshed.\n"
+        "• You can now manage this group seamlessly in private chat.",
+        parse_mode="HTML"
+    )
+    asyncio.create_task(auto_delete_message(chat.id, reply.message_id, 15))
+
+
+@bot.message_handler(commands=["status"])
 async def cmd_status(message: types.Message):
     """
     /status: Displays current configuration of the group (Admin Only).
@@ -1354,6 +1728,11 @@ async def cmd_status(message: types.Message):
     link_exempt_count = len(config.get("free_links", set()))
     has_custom_msg = "Customized ✅" if config.get("custom_bio_msg") else "Default (@i_am_turtle) ℹ️"
 
+    bot_uname = bot_metadata.get("username") or "bioLinkChannelBot"
+    settings_url = f"https://t.me/{bot_uname}?start=settings_{chat_id}"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("⚙️ Open in pvt ↗", url=settings_url))
+
     status_text = (
         "⚙️ <b>BioLink Protection: ACTIVE ✅ (Default)</b>\n\n"
         f"• <b>Configured Action:</b> <code>{action}</code>\n"
@@ -1371,7 +1750,7 @@ async def cmd_status(message: types.Message):
         "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code>\n"
         "• <code>/toggleadmin</code>"
     )
-    reply = await bot.reply_to(message, status_text, parse_mode="HTML")
+    reply = await bot.reply_to(message, status_text, parse_mode="HTML", reply_markup=markup)
     asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 25))
 
 
@@ -1828,6 +2207,8 @@ async def register_bot_commands():
     """
     admin_commands = [
         types.BotCommand("start", "Activate & verify bot protection"),
+        types.BotCommand("settings", "Open group settings in private"),
+        types.BotCommand("reload", "Reload group admin list & title"),
         types.BotCommand("setaction", "Set punishment: delete, warn, mute, ban"),
         types.BotCommand("toggleadmin", "Toggle admin scanning (default: scanned)"),
         types.BotCommand("free", "Exempt bio or links (/free or /free link)"),
@@ -1840,7 +2221,8 @@ async def register_bot_commands():
     ]
 
     private_commands = [
-        types.BotCommand("start", "Start the bot & get setup instructions"),
+        types.BotCommand("start", "Main menu & group settings"),
+        types.BotCommand("settings", "Manage group settings"),
         types.BotCommand("help", "Show setup & administration guide"),
     ]
 
@@ -1921,7 +2303,7 @@ async def main():
                     skip_pending=True,
                     timeout=20,
                     request_timeout=25,
-                    allowed_updates=["message", "edited_message"]
+                    allowed_updates=["message", "edited_message", "callback_query"]
                 )
                 break
             except TELEGRAM_EXCEPTIONS as e:

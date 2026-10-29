@@ -43,12 +43,34 @@ It actively protects Telegram groups against spam bots, promotion accounts, and 
 - **`/status`**: Displays a real-time configuration dashboard of the group.
 - **`/help`**: Lists available commands and usage instructions.
 
-### 3. Private DM Group Management (Group Help Bot Style)
-- When any **Administrator, Group Owner, or Anonymous Admin** messages the bot in Private Chat (DM) or sends `/start`, `/groups`, or `/chats`:
-  - The bot automatically scans all active groups connected to this bot.
-  - Generates an interactive inline keyboard listing all groups managed by that admin: `[ 👥 Group Title (✅ Active) ]`.
-  - Tapping any group button loads a full live dashboard for that specific group (Status, Action, Admin Filtering, Bio Exempt Users, Link Allowed Users, and Notice Status) with `[ 🔄 Refresh ]` and `[ ⬅️ Back ]` buttons.
-  - If a user is not yet an admin in any group, it provides a one-click `[ ➕ Add Bot to Group ]` link.
+### 3. Private DM Group Management (Exact Group Help Bot UI)
+- **Screen 1 — Welcome Screen (`/start` in Private DM)**:
+  - Welcome greeting: *"👋 Hello! BioLink Restrictor is the most complete Bot to help you manage your groups easily and safely!"*
+  - Buttons:
+    - `[ ➕ Add me to a Group ➕ ]` (Opens Telegram group adder)
+    - `[ ⚙️ Manage group Settings ✍️ ]` (Navigates to Group Selector)
+    - `[ 👥 Support / Approval ↗ ]` (Direct link to `@i_am_turtle`) | `[ ℹ️ Information 💬 ]` (Bot uptime & memory stats)
+    - `[ 📖 Commands Guide ]` (Complete command catalog)
+- **Screen 2 — Group Selector (`Manage group Settings`)**:
+  - Displays *"Manage group Settings 👉 Select the group whose settings you want to change."*
+  - Vertical list of managed groups where the user is detected as an administrator.
+  - Helpful prompts matching Group Help:
+    - *• Send `/reload` in the group and try again*
+    - *• Send `/settings` in the group and then press "Open in pvt"*
+  - Buttons: `[ 🔄 Refresh List ]` and `[ ⬅️ Back to Menu ]`.
+- **Screen 3 — SETTINGS Grid (`Group: <name>`)**:
+  - 2-column interactive grid matching Group Help layout:
+    - `[ 📜 Bio & Channel ]` | `[ 📨 In-Chat Links ]`
+    - `[ ⚖️ Action: <Action> ]` *(Tap to cycle: delete ➔ warn ➔ mute ➔ ban live)*
+    - `[ 🛡️ Admins: Filter ON / Exempt ]` *(Tap to toggle admin scanning live)*
+    - `[ 👥 Bio Exempt (<count>) ]` | `[ 🔗 Link Allowed (<count>) ]`
+    - `[ 📢 30s Notice Msg ]` | `[ 🗑 Deleting Messages ]`
+    - `[ 🕵️‍♂️ Anti-Promotion ]` | `[ 🎛 Approval Mode ]`
+    - Bottom Bar: `[ ⬅️ Back ]` | `[ ✅ Close ]` | `[ 🔄 Reload ]`
+- **Group Chat Integration**:
+  - **`/settings` in Group**: Responds with an inline button `[ ⚙️ Open in pvt ↗ ]` deep-linking to private chat (`?start=settings_<chat_id>`).
+  - **`/reload` in Group**: Refreshes the administrator list, updates group title, and pre-warms the cache.
+  - Commands auto-delete within 3 seconds to keep chats clean.
 
 ### 4. Exemption Commands (`/free` & `/unfree`)
 - **Restricted To**: **Group Owner (Creator)** and **Anonymous Admin** only.

@@ -24,7 +24,11 @@ from main import (
     format_bio_delete_notice,
     DEFAULT_BIO_DELETE_MSG,
     render_groups_list,
-    render_single_group_dashboard
+    render_single_group_dashboard,
+    render_welcome_screen,
+    render_groups_selector,
+    render_group_settings_grid,
+    render_sub_setting
 )
 from telebot import types
 
@@ -283,10 +287,24 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         active_groups.clear()
         admin_cache.clear()
 
+    async def test_welcome_screen_rendering(self):
+        user = types.User(id=111222, is_bot=False, first_name="OwnerAlice")
+        text, markup = render_welcome_screen(user)
+        self.assertIn("Hello!", text)
+        self.assertIn("Add me in a Supergroup and promote me as Admin", text)
+        markup_dict = markup.to_dict()
+        buttons_text = str(markup_dict)
+        self.assertIn("Manage group Settings", buttons_text)
+        self.assertIn("Support / Approval", buttons_text)
+        self.assertIn("Information", buttons_text)
+        self.assertIn("Commands Guide", buttons_text)
+
     async def test_no_managed_groups(self):
         user = types.User(id=999999, is_bot=False, first_name="RandomUser")
-        text, keyboard = await render_groups_list(user)
-        self.assertIn("not currently registered as an administrator", text)
+        text, keyboard = await render_groups_selector(user)
+        self.assertIn("not currently detected as an administrator", text)
+        self.assertIn("/reload", text)
+        self.assertIn("/settings", text)
         self.assertIsNotNone(keyboard)
 
     async def test_managed_group_rendering(self):
@@ -297,13 +315,34 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         admin_cache[chat_id] = ({admin_id}, time.monotonic() + 300)
 
         user = types.User(id=admin_id, is_bot=False, first_name="Manager")
-        text, keyboard = await render_groups_list(user)
+        text, keyboard = await render_groups_selector(user)
         self.assertIn("VIP Trading Lounge", str(keyboard.to_dict()))
 
-        dash_text, dash_kb = await render_single_group_dashboard(chat_id, admin_id)
+        # Grid view (Screen 3)
+        dash_text, dash_kb = render_group_settings_grid(chat_id)
+        self.assertIn("SETTINGS", dash_text)
         self.assertIn("VIP Trading Lounge", dash_text)
-        self.assertIn("Active ✅", dash_text)
-        self.assertIn(str(chat_id), dash_text)
+        grid_buttons = str(dash_kb.to_dict())
+        self.assertIn("Bio & Channel", grid_buttons)
+        self.assertIn("In-Chat Links", grid_buttons)
+        self.assertIn("Action:", grid_buttons)
+        self.assertIn("Admins:", grid_buttons)
+        self.assertIn("Bio Exempt", grid_buttons)
+        self.assertIn("Link Allowed", grid_buttons)
+        self.assertIn("30s Notice Msg", grid_buttons)
+        self.assertIn("Deleting Messages", grid_buttons)
+        self.assertIn("Anti-Promotion", grid_buttons)
+        self.assertIn("Approval Mode", grid_buttons)
+
+    async def test_sub_settings_rendering(self):
+        chat_id = -10011223344
+        config = get_group_config(chat_id)
+        config["title"] = "Crypto Elite"
+
+        for sub_type in ["bio", "links", "free", "freel", "notice", "delmsg", "promo", "apprv"]:
+            sub_text, sub_kb = render_sub_setting(chat_id, sub_type)
+            self.assertIn("Crypto Elite", sub_text)
+            self.assertIn("Back to Settings", str(sub_kb.to_dict()))
 
 
 if __name__ == "__main__":
