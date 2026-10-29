@@ -64,7 +64,7 @@ It actively protects Telegram groups against spam bots, promotion accounts, and 
     - `[ ⚖️ Action: <Action> ]` *(Tap to cycle: delete ➔ warn ➔ mute ➔ ban live)*
     - `[ 🛡️ Admins: Filter ON / Exempt ]` *(Tap to toggle admin scanning live)*
     - `[ 👥 Bio Exempt (<count>) ]` | `[ 🔗 Link Allowed (<count>) ]`
-    - `[ 📢 30s Notice Msg ]` | `[ 🗑 Deleting Messages ]`
+    - `[ 📢 10s Notice Msg ]` | `[ 🗑 Deleting Messages ]`
     - `[ 🕵️‍♂️ Anti-Promotion ]` | `[ 🎛 Approval Mode ]`
     - Bottom Bar: `[ ⬅️ Back ]` | `[ ✅ Close ]` | `[ 🔄 Reload ]`
 - **Group Chat Integration**:
@@ -93,7 +93,7 @@ It actively protects Telegram groups against spam bots, promotion accounts, and 
 - **Check 2: Profile Bio & Connected Channel Filter**:
   - Inspects `personal_chat` (connected channel) and `chat.bio` / `business_intro`.
   - Violating messages are deleted immediately.
-  - An informative response notice is sent tagging the user and directing them to contact `@i_am_turtle` for approval (auto-deleted after 30s).
+  - An informative response notice is sent tagging the user and directing them to contact `@i_am_turtle` for approval (auto-deleted after 10s; older notices are immediately removed when a new notification arrives to keep only the latest active).
 - **Check 3: Administrator Filtering**:
   - Admins are scanned by default unless `/toggleadmin` is toggled.
   - Group Owner and Anonymous Admin are always exempt.

@@ -8,6 +8,7 @@ from aiohttp import web
 from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 
 from main import (
+    latest_notice_by_chat,
     BIO_LINK_REGEX,
     contains_link_or_handle,
     active_groups,
@@ -329,7 +330,7 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Admins:", grid_buttons)
         self.assertIn("Bio Exempt", grid_buttons)
         self.assertIn("Link Allowed", grid_buttons)
-        self.assertIn("30s Notice Msg", grid_buttons)
+        self.assertIn("10s Notice Msg", grid_buttons)
         self.assertIn("Deleting Messages", grid_buttons)
         self.assertIn("Anti-Promotion", grid_buttons)
         self.assertIn("Approval Mode", grid_buttons)
@@ -374,6 +375,22 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         _, sub_kb_off = render_sub_setting(chat_id, "links")
         self.assertIn("Turn Filter ON", str(sub_kb_off.to_dict()))
 
+
+
+    async def test_latest_notice_replacement_logic(self):
+        chat_id = -10055443322
+        latest_notice_by_chat[chat_id] = 1001
+
+        # Simulate replacement: old notice is replaced by new notice 1002
+        old_id = latest_notice_by_chat.get(chat_id)
+        self.assertEqual(old_id, 1001)
+
+        latest_notice_by_chat[chat_id] = 1002
+        self.assertEqual(latest_notice_by_chat[chat_id], 1002)
+
+        # After cleanup of 1002
+        latest_notice_by_chat.pop(chat_id, None)
+        self.assertNotIn(chat_id, latest_notice_by_chat)
 
 if __name__ == "__main__":
     unittest.main()

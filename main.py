@@ -122,6 +122,10 @@ bio_cache: Dict[int, Tuple[bool, str, float]] = {}
 in_flight_admin_scans: Dict[int, asyncio.Future] = {}
 in_flight_bio_scans: Dict[int, asyncio.Future] = {}
 
+# Tracks the latest active bio violation notice message per chat: chat_id -> message_id
+# Ensures only the single latest notice stays in the group; older notices are immediately deleted
+latest_notice_by_chat: Dict[int, int] = {}
+
 def load_settings() -> Dict[int, Dict[str, Any]]:
     """Loads saved settings from settings.json if present."""
     groups: Dict[int, Dict[str, Any]] = {}
@@ -560,8 +564,29 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
     custom_msg = group_config.get("custom_bio_msg")
     notice_text = format_bio_delete_notice(custom_msg, user)
     try:
+        # User requirement: Delete old notification when new/latest notification arrives; keep ONLY the latest
+        old_notice_id = latest_notice_by_chat.get(chat_id)
+        if old_notice_id:
+            try:
+                await bot.delete_message(chat_id, old_notice_id)
+            except Exception:
+                pass
+
         notice_msg = await bot.send_message(chat_id, notice_text, parse_mode="HTML")
-        asyncio.create_task(auto_delete_message(chat_id, notice_msg.message_id, delay_seconds=30))
+        latest_notice_by_chat[chat_id] = notice_msg.message_id
+
+        # User requirement: Auto-delete the latest notification in exactly 10 seconds
+        async def _cleanup_latest_notice(c_id: int, m_id: int):
+            await asyncio.sleep(10)
+            try:
+                await bot.delete_message(c_id, m_id)
+            except Exception:
+                pass
+            finally:
+                if latest_notice_by_chat.get(c_id) == m_id:
+                    latest_notice_by_chat.pop(c_id, None)
+
+        asyncio.create_task(_cleanup_latest_notice(chat_id, notice_msg.message_id))
     except Exception as e:
         logger.warning(f"Could not deliver bio violation notice in {chat_id}: {e}")
 
@@ -755,7 +780,7 @@ def render_group_settings_grid(chat_id: int) -> Tuple[str, types.InlineKeyboardM
     markup.row(btn_free, btn_free_links)
 
     # Row 4: Bio notice message | Deleting messages info
-    btn_notice = types.InlineKeyboardButton("📢 30s Notice Msg", callback_data=f"sub_notice_{chat_id}")
+    btn_notice = types.InlineKeyboardButton("📢 10s Notice Msg", callback_data=f"sub_notice_{chat_id}")
     btn_delmsg = types.InlineKeyboardButton("🗑 Deleting Messages", callback_data=f"sub_delmsg_{chat_id}")
     markup.row(btn_notice, btn_delmsg)
 
@@ -785,7 +810,7 @@ def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.InlineKe
     if sub_type == "bio":
         filter_bio = config.get("filter_bio", True)
         status_str = "Active ✅ (Default)" if filter_bio else "Disabled ❌ (Off)"
-        action_str = "Violating messages are deleted immediately + a 30s notice is sent." if filter_bio else "Disabled (Users with links/channels in bio are allowed to chat)."
+        action_str = "Violating messages are deleted immediately + a 10s notice is sent." if filter_bio else "Disabled (Users with links/channels in bio are allowed to chat)."
         text = (
             f"📜 <b>Bio & Connected Channel Scanner</b>\n"
             f"<b>Group:</b> {html.escape(title)}\n\n"
@@ -846,7 +871,8 @@ def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.InlineKe
             f"<b>Group:</b> {html.escape(title)}\n\n"
             f"<b>Current Active Notice:</b>\n"
             f"{html.escape(current_text)}\n\n"
-            f"• <b>Auto-Delete Timer:</b> 30 seconds\n\n"
+            f"• <b>Auto-Delete Timer:</b> 10 seconds\n"
+            f"• <b>Active Notice:</b> Only latest notification kept (older notices deleted immediately)\n\n"
             f"<b>Commands to customize:</b>\n"
             f"• <code>/setmsg &lt;your message&gt;</code> - Set custom message\n"
             f"• <code>/resetmsg</code> - Reset back to default"
@@ -857,7 +883,7 @@ def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.InlineKe
             f"<b>Group:</b> {html.escape(title)}\n\n"
             f"• <b>Admin / Owner Commands:</b> Auto-deleted within 3 seconds to keep chat clean.\n"
             f"• <b>Bot Command Replies:</b> Auto-deleted within 15–25 seconds.\n"
-            f"• <b>Bio Violation Notice:</b> Auto-deleted after 30 seconds.\n"
+            f"• <b>Bio Violation Notice:</b> Auto-deleted after 10 seconds (older notices deleted when new notice arrives).\n"
             f"• <b>In-Chat Link Violations:</b> Silently deleted in 0.1–0.3 seconds with no notification."
         )
     elif sub_type == "promo":
@@ -967,7 +993,7 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
             "• <code>/free link &lt;user&gt;</code> - Permit sending links (Owner/Anon Admin only)\n"
             "• <code>/unfree &lt;user&gt;</code> - Revoke bio exemption\n"
             "• <code>/unfree link &lt;user&gt;</code> - Revoke link permission\n"
-            "• <code>/setmsg &lt;text&gt;</code> - Customize 30s bio deletion notice\n"
+            "• <code>/setmsg &lt;text&gt;</code> - Customize 10s bio deletion notice\n"
             "• <code>/resetmsg</code> - Reset bio notice to default\n"
             "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code>\n"
             "• <code>/toggleadmin</code> - Toggle admin filtering"
