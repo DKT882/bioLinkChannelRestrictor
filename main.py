@@ -80,7 +80,8 @@ BIO_LINK_REGEX = re.compile(
     r'|t\.me/\S+'
     r'|telegram\.me/\S+'
     r'|telegram\.dog/\S+'
-    r'|\b[a-zA-Z0-9.-]+\.(?:com|org|net|edu|gov|io|me|co|info|xyz|app|dev|ai|cc|top|club|site|online|vip|pro|link|bio|ly|ee|to|gg|is|tech|ru|in|de|uk|ca|fr|br|nl|tv|cx|ws)\b(?:/\S*)?'
+    r'|tg://\S+'
+    r'|\b[a-zA-Z0-9.-]+\.(?:com|org|net|edu|gov|io|me|co|info|xyz|app|dev|ai|cc|top|club|site|online|vip|pro|link|bio|ly|ee|to|gg|is|tech|ru|in|de|uk|ca|fr|br|nl|tv|cx|ws|porn|xxx|sex|adult|cam|live|click|beauty|shop|store|world|today|fun|cloud|monster|space|press|rest|lat|fit|hair|bot)\b(?:/\S*)?'
     r'|@[a-zA-Z0-9_]{3,}'
     r')',
     re.IGNORECASE
@@ -113,7 +114,7 @@ SETTINGS_FILE = "settings.json"
 username_to_id: Dict[str, int] = {}
 
 # Admin status cache: chat_id -> (set of admin user IDs, expire_monotonic_timestamp)
-admin_cache: Dict[int, Tuple[Set[int], float]] = {}
+admin_cache: Dict[int, Tuple[Set[int], Optional[int], float]] = {}
 
 # Bio scan cache: user_id -> (has_violation: bool, reason: str, expire_monotonic_timestamp)
 bio_cache: Dict[int, Tuple[bool, str, float]] = {}
@@ -151,8 +152,7 @@ def load_settings() -> Dict[int, Dict[str, Any]]:
                         "title": cfg.get("title", ""),
                         "filter_links": cfg.get("filter_links", True),
                         "filter_bio": cfg.get("filter_bio", True),
-                "send_bio_notice": cfg.get("send_bio_notice", True),
-                        "send_bio_notice": cfg.get("send_bio_notice", True)
+                "send_bio_notice": cfg.get("send_bio_notice", True)
                     }
             logger.info(f"Loaded persistent configurations for {len(groups)} group(s).")
         except Exception as e:
@@ -176,7 +176,8 @@ def save_settings():
                 "custom_bio_msg": cfg.get("custom_bio_msg", None),
                 "title": cfg.get("title", ""),
                 "filter_links": cfg.get("filter_links", True),
-                "filter_bio": cfg.get("filter_bio", True)
+                "filter_bio": cfg.get("filter_bio", True),
+                "send_bio_notice": cfg.get("send_bio_notice", True)
             }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -277,19 +278,20 @@ async def is_user_admin(chat_id: int, user_id: int, message: Optional[types.Mess
 
     # Fast check in-memory cache
     if chat_id in admin_cache:
-        cached_admins, expiry = admin_cache[chat_id]
+        entry = admin_cache[chat_id]
+        cached_admins = entry[0]
+        expiry = entry[-1]
         if now < expiry:
             return user_id in cached_admins
 
-    # In-flight de-duplication: if another coroutine is already fetching admins for this chat, await it
+    # In-flight de-duplication
     if chat_id in in_flight_admin_scans:
         try:
-            admin_ids = await in_flight_admin_scans[chat_id]
+            admin_ids, _ = await in_flight_admin_scans[chat_id]
             return user_id in admin_ids
         except Exception:
             pass
 
-    # Create new future for in-flight request
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     in_flight_admin_scans[chat_id] = future
@@ -297,9 +299,10 @@ async def is_user_admin(chat_id: int, user_id: int, message: Optional[types.Mess
     try:
         admins = await bot.get_chat_administrators(chat_id)
         admin_ids = {a.user.id for a in admins if a.user}
-        admin_cache[chat_id] = (admin_ids, now + ADMIN_CACHE_TTL)
+        owner_id = next((a.user.id for a in admins if a.user and a.status == "creator"), None)
+        admin_cache[chat_id] = (admin_ids, owner_id, now + ADMIN_CACHE_TTL)
         if not future.done():
-            future.set_result(admin_ids)
+            future.set_result((admin_ids, owner_id))
         return user_id in admin_ids
     except TELEGRAM_EXCEPTIONS as e:
         if not future.done():
@@ -322,7 +325,7 @@ async def is_user_admin(chat_id: int, user_id: int, message: Optional[types.Mess
 async def is_owner_or_anonymous_admin(chat_id: int, user_id: int, message: Optional[types.Message] = None) -> bool:
     """
     Verifies if the caller is the Group Owner (creator) or an Anonymous Admin.
-    Only the Group Owner and Anonymous Admin are permitted to exempt/unexempt users.
+    Zero-network check when admin_cache is warm.
     """
     if message:
         # Sender posting anonymously as the group
@@ -334,6 +337,30 @@ async def is_owner_or_anonymous_admin(chat_id: int, user_id: int, message: Optio
 
     if not user_id:
         return False
+
+    now = time.monotonic()
+    if chat_id in admin_cache:
+        entry = admin_cache[chat_id]
+        cached_admins = entry[0]
+        owner_id = entry[1] if len(entry) == 3 else None
+        expiry = entry[-1]
+        if now < expiry:
+            # Group owner is guaranteed to be an administrator in Telegram
+            if user_id not in cached_admins:
+                return False
+            if owner_id is not None:
+                return user_id == owner_id
+
+    # If cache is cold or owner not yet resolved, refresh admin cache
+    await is_user_admin(chat_id, user_id, message)
+    if chat_id in admin_cache:
+        entry = admin_cache[chat_id]
+        cached_admins = entry[0]
+        owner_id = entry[1] if len(entry) == 3 else None
+        if user_id not in cached_admins:
+            return False
+        if owner_id is not None:
+            return user_id == owner_id
 
     try:
         member = await bot.get_chat_member(chat_id, user_id)
@@ -482,10 +509,12 @@ CHAT_HTML_LINK_REGEX = re.compile(r'<a\s+[^>]*href=["\']https?://', re.IGNORECAS
 
 def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
     """
-    Ultra-fast scanner for in-chat links, forwards, mentions, and external bot links.
+    Ultra-fast scanner for all kinds of in-chat links, forwards, mentions,
+    table links (inline keyboard buttons with URLs/web apps), inline bots,
+    multiple links, telegram deep links, markdown/HTML links, and contact info.
     Returns (has_link: bool, reason: str).
     """
-    # 1. Forward check (from user, bot, channel, group, hidden sender, or forward_origin)
+    # 1. Forward check (from user, bot, channel, group, hidden sender, signature, or forward_origin)
     if message.forward_date is not None:
         return True, "Forwarded message"
     if getattr(message, "forward_from", None) is not None:
@@ -494,10 +523,36 @@ def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
         return True, "Forwarded message (from channel/group)"
     if getattr(message, "forward_sender_name", None) is not None:
         return True, "Forwarded message (from hidden sender)"
+    if getattr(message, "forward_signature", None) is not None:
+        return True, "Forwarded message (channel signature)"
     if getattr(message, "forward_origin", None) is not None:
         return True, "Forwarded message (forward_origin)"
 
-    # 2. Telegram pre-parsed message entities & caption entities (takes microseconds)
+    # 2. Table Links & Inline Keyboard Buttons
+    # Detects button tables/grids containing URLs, web apps, or switch query spam
+    if getattr(message, "reply_markup", None) is not None:
+        rm = message.reply_markup
+        inline_rows = getattr(rm, "keyboard", None) or getattr(rm, "inline_keyboard", None) or []
+        for row in inline_rows:
+            for btn in row:
+                btn_url = getattr(btn, "url", None)
+                if btn_url:
+                    return True, f"Inline table link button ({btn_url})"
+                if getattr(btn, "web_app", None):
+                    return True, "Inline button Web App link"
+                if getattr(btn, "login_url", None):
+                    return True, "Inline button login URL"
+                if getattr(btn, "switch_inline_query", None) is not None or getattr(btn, "switch_inline_query_current_chat", None) is not None:
+                    return True, "Inline button switch query"
+                return True, "Inline keyboard table button"
+
+    # 3. Message sent via Inline Bot (@bot query)
+    if getattr(message, "via_bot", None) is not None:
+        bot_user = message.via_bot
+        uname = f"@{bot_user.username}" if getattr(bot_user, "username", None) else f"ID:{bot_user.id}"
+        return True, f"Message sent via inline bot ({uname})"
+
+    # 4. Telegram pre-parsed message entities & caption entities (takes microseconds)
     entities = (message.entities or []) + (message.caption_entities or [])
     if entities:
         for ent in entities:
@@ -508,8 +563,22 @@ def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
                 return True, f"Mention entity ({e_type})"
             if e_type == "custom_emoji":
                 return True, "Custom emoji link"
+            if e_type in ("phone_number", "email"):
+                return True, f"Contact link ({e_type})"
+            if e_type == "bot_command":
+                cmd_text = (message.text or message.caption or "")[ent.offset : ent.offset + ent.length]
+                if "@" in cmd_text:
+                    return True, f"External bot command ({cmd_text})"
 
-    # 3. Raw text and caption inspection (pre-filter to avoid unnecessary regex)
+    # 5. Telegram Link Preview / Web Page Preview
+    if getattr(message, "link_preview_options", None) is not None:
+        lpo = message.link_preview_options
+        if getattr(lpo, "url", None):
+            return True, f"Link preview ({lpo.url})"
+    if getattr(message, "web_page", None) is not None:
+        return True, "Web page preview"
+
+    # 6. Raw text and caption inspection (supports multiple links, deep links, adult/spam TLDs)
     combined_text = ""
     if message.text:
         combined_text += message.text + " "
@@ -517,7 +586,7 @@ def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
         combined_text += message.caption
 
     if combined_text:
-        if any(ch in combined_text for ch in (".", ":", "/", "@", "[", "<")):
+        if any(ch in combined_text for ch in (".", ":", "/", "@", "[", "<", "t.me", "http", "tg:")):
             if BIO_LINK_REGEX.search(combined_text):
                 return True, "URL or handle in message"
             if CHAT_MARKDOWN_LINK_REGEX.search(combined_text):
@@ -1937,7 +2006,8 @@ async def cmd_reload(message: types.Message):
     try:
         admins = await bot.get_chat_administrators(chat.id)
         admin_ids = {m.user.id for m in admins}
-        admin_cache[chat.id] = (admin_ids, time.monotonic() + ADMIN_CACHE_TTL)
+        owner_id = next((a.user.id for a in admins if a.user and a.status == "creator"), None)
+        admin_cache[chat.id] = (admin_ids, owner_id, time.monotonic() + ADMIN_CACHE_TTL)
         if db_manager.is_connected:
             asyncio.create_task(db_manager.upsert_group(chat_id=chat.id, title=chat.title or ""))
     except Exception as e:
@@ -2092,16 +2162,13 @@ async def process_chat_message(message: types.Message):
     """
     Core Filter Engine:
     1. Fast Filter: Groups & supergroups only; ignore command messages.
-    2. Username Tracking: Dynamically records usernames to user IDs for resolution.
-    3. Anonymous Admin Bypass: Allowed.
-    4. Check 1 - In-Chat Link & Forward Filter:
-       - Detects forwards, URLs, inline links, mentions, table links.
-       - Allowed ONLY IF sender is in free_links or is Owner/Anon Admin.
-       - On violation: Silently deletes message immediately without sending mention message!
-    5. Check 2 - Profile Bio & Connected Channel Filter:
-       - Skipped if user is in free_list or Owner/Anon Admin or ignore_admins is True for admins.
-       - On violation: Deletes message, sends mentioned response notice with contact @i_am_turtle,
-         and executes configured action.
+    2. Bot Self-Check & Anonymous Admin check.
+    3. PRIORITY 1 - In-Chat Link & Forward Filter:
+       - Detects table links (inline keyboard buttons), inline bots, multiple links,
+         forwards, external channels, URL/mention entities, and deep links.
+       - Silently deleted INSTANTLY on priority basis with ZERO delay.
+    4. PRIORITY 2 - Profile Bio & Connected Channel Filter:
+       - Scans bio/channel; executes configured punishment (delete/warn/mute/ban).
     """
     # Filter 0: Only operate on groups & supergroups
     if message.chat.type not in ("group", "supergroup"):
@@ -2118,16 +2185,10 @@ async def process_chat_message(message: types.Message):
     if not group_config.get("activated", True):
         return
 
-    # Track group title
-    if message.chat.title and group_config.get("title") != message.chat.title:
-        group_config["title"] = message.chat.title
-        save_settings()
-        if db_manager.is_connected:
-            asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, title=message.chat.title))
-
-    # Track username to user_id mapping dynamically for /free lookup
-    if message.from_user and message.from_user.username:
-        username_to_id[message.from_user.username.lower()] = message.from_user.id
+    # Skip messages sent by this bot itself
+    bot_id = bot_metadata.get("id")
+    if message.from_user and bot_id and message.from_user.id == bot_id:
+        return
 
     # Check for Anonymous Admin (posted as chat channel or via AnonymousBot)
     is_anon_admin = bool(
@@ -2138,14 +2199,13 @@ async def process_chat_message(message: types.Message):
     if is_anon_admin:
         return
 
-    # If sender is missing or is an automated bot/service, skip
-    if not message.from_user or message.from_user.is_bot:
+    # Sender ID resolution (handles regular user, external channel, or bot)
+    user_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else 0)
+    if not user_id:
         return
 
-    user_id = message.from_user.id
-
     # --------------------------------------------------------------------------
-    # Check 1: In-Chat Link & Forward Restriction
+    # Check 1: In-Chat Link & Forward Restriction (PRIORITY 1 - INSTANT SCAN)
     # --------------------------------------------------------------------------
     if group_config.get("filter_links", True):
         has_chat_link, link_reason = detect_chat_link(message)
@@ -2154,15 +2214,16 @@ async def process_chat_message(message: types.Message):
             is_link_allowed = (user_id in free_links)
 
             if not is_link_allowed:
-                # Check if user is Group Owner or Anonymous Admin
-                if await is_owner_or_anonymous_admin(chat_id, user_id, message):
-                    is_link_allowed = True
-                elif group_config.get("ignore_admins", False):
-                    if await is_user_admin(chat_id, user_id, message):
+                # Fast check for Admin/Owner exemptions
+                if await is_user_admin(chat_id, user_id, message):
+                    if await is_owner_or_anonymous_admin(chat_id, user_id, message):
+                        is_link_allowed = True
+                    elif group_config.get("ignore_admins", False):
                         is_link_allowed = True
 
             if not is_link_allowed:
-                # User requirement: Silently delete message; DO NOT send response mention notice
+                # INSTANT PRIORITY DELETION:
+                # Dispatched immediately before any database or background tasks
                 try:
                     await bot.delete_message(chat_id, message.message_id)
                 except TELEGRAM_EXCEPTIONS as e:
@@ -2170,11 +2231,13 @@ async def process_chat_message(message: types.Message):
 
                 if db_manager.is_connected:
                     msg_content = message.text or message.caption or ""
+                    u_name = message.from_user.username if message.from_user else ""
+                    f_name = message.from_user.first_name if message.from_user else (message.sender_chat.title if message.sender_chat else "")
                     asyncio.create_task(db_manager.log_moderation_event(
                         chat_id=chat_id,
                         user_id=user_id,
-                        username=message.from_user.username or "",
-                        first_name=message.from_user.first_name or "",
+                        username=u_name or "",
+                        first_name=f_name or "",
                         is_admin=False,
                         violation_type="chat_link",
                         violation_detail=link_reason,
@@ -2182,6 +2245,17 @@ async def process_chat_message(message: types.Message):
                         message_text=msg_content
                     ))
                 return
+
+    # Dynamic username tracking (for /free lookup)
+    if message.from_user and message.from_user.username:
+        username_to_id[message.from_user.username.lower()] = message.from_user.id
+
+    # Track group title
+    if message.chat.title and group_config.get("title") != message.chat.title:
+        group_config["title"] = message.chat.title
+        save_settings()
+        if db_manager.is_connected:
+            asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, title=message.chat.title))
 
     # --------------------------------------------------------------------------
     # Check 2: Profile Bio & Connected Channel Restriction
@@ -2455,7 +2529,7 @@ async def cache_pruning_task():
             now = time.monotonic()
 
             # Prune admin cache
-            expired_admins = [cid for cid, (_, exp) in admin_cache.items() if now >= exp]
+            expired_admins = [cid for cid, (_, _, exp) in list(admin_cache.items()) if now >= exp]
             for cid in expired_admins:
                 admin_cache.pop(cid, None)
 

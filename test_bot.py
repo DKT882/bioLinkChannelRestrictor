@@ -234,6 +234,86 @@ class TestChatLinkDetection(unittest.TestCase):
         self.assertTrue(has_link)
         self.assertIn("Mention entity", reason)
 
+    def test_table_links_inline_keyboard(self):
+        # Emulates spam message from images 1 & 2 with table/matrix of inline buttons
+        msg = types.Message(
+            message_id=6,
+            from_user=types.User(id=106, is_bot=False, first_name="Nobody"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Time's almost over. Choose the intense one you can't resist 💦"
+        msg.entities = []
+        markup = types.InlineKeyboardMarkup()
+        markup.add(
+            types.InlineKeyboardButton("🔞 Great videos for 18+ 👅", url="https://t.me/somelink1"),
+            types.InlineKeyboardButton("💦 Try watching 🍒 😍", url="https://t.me/somelink2")
+        )
+        msg.reply_markup = markup
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertIn("Inline table link button", reason)
+
+    def test_via_bot_message(self):
+        # Emulates message posted through inline bot
+        msg = types.Message(
+            message_id=7,
+            from_user=types.User(id=107, is_bot=False, first_name="User"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Interactive game!"
+        msg.entities = []
+        msg.via_bot = types.User(id=999, is_bot=True, first_name="SpamBot", username="hhotroombot")
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertIn("Message sent via inline bot", reason)
+
+    def test_multiple_links_in_photo_caption(self):
+        # Emulates spam message from image 3 with multiple consecutive links in caption
+        msg = types.Message(
+            message_id=8,
+            from_user=types.User(id=108, is_bot=False, first_name="Deleted Account"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="photo",
+            options={},
+            json_string=""
+        )
+        msg.caption = (
+            "CLICK BELOW TO WATCH XXXPORN VIDEOS\n"
+            "⤵️ ⤵️ ⤵️\n"
+            "https://t.me/hhotroombot?startapp=143443\n"
+            "https://t.me/hhotroombot?startapp=143443\n"
+            "https://t.me/hhotroombot?startapp=143443"
+        )
+        msg.caption_entities = []
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertEqual(reason, "URL or handle in message")
+
+    def test_tg_protocol_link(self):
+        msg = types.Message(
+            message_id=9,
+            from_user=types.User(id=109, is_bot=False, first_name="Alex"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Join using tg://join?invite=abcdef"
+        msg.entities = []
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertEqual(reason, "URL or handle in message")
+
     def test_raw_regex_link(self):
         msg = types.Message(
             message_id=5,

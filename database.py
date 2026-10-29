@@ -156,10 +156,10 @@ class DatabaseManager:
     async def upsert_group(
         self,
         chat_id: int,
-        title: str = "",
-        activated: bool = True,
-        action: str = "delete",
-        ignore_admins: bool = False,
+        title: Optional[str] = None,
+        activated: Optional[bool] = None,
+        action: Optional[str] = None,
+        ignore_admins: Optional[bool] = None,
         custom_bio_msg: Optional[str] = None,
         filter_links: Optional[bool] = None,
         filter_bio: Optional[bool] = None,
@@ -167,20 +167,22 @@ class DatabaseManager:
     ):
         """
         Persists or updates group settings in MongoDB atomically.
+        Only fields explicitly provided (not None) are updated in $set.
         """
         if not self.is_connected or self.db is None:
             return
 
         now = datetime.utcnow()
         try:
-            update_fields: Dict[str, Any] = {
-                "activated": activated,
-                "action": action,
-                "ignore_admins": ignore_admins,
-                "updated_at": now
-            }
-            if title:
+            update_fields: Dict[str, Any] = {"updated_at": now}
+            if title is not None:
                 update_fields["title"] = title
+            if activated is not None:
+                update_fields["activated"] = activated
+            if action is not None:
+                update_fields["action"] = action
+            if ignore_admins is not None:
+                update_fields["ignore_admins"] = ignore_admins
             if custom_bio_msg is not None:
                 update_fields["custom_bio_msg"] = custom_bio_msg
             if filter_links is not None:
@@ -195,13 +197,17 @@ class DatabaseManager:
                 {
                     "$set": update_fields,
                     "$setOnInsert": {
+                        "title": title or "",
+                        "activated": activated if activated is not None else True,
+                        "action": action if action is not None else "delete",
+                        "ignore_admins": ignore_admins if ignore_admins is not None else False,
                         "free_list": [],
                         "free_links": [],
-                        "custom_bio_msg": None,
+                        "custom_bio_msg": custom_bio_msg,
                         "exemptions_detail": [],
-                        "filter_links": True,
-                        "filter_bio": True,
-                        "send_bio_notice": True,
+                        "filter_links": filter_links if filter_links is not None else True,
+                        "filter_bio": filter_bio if filter_bio is not None else True,
+                        "send_bio_notice": send_bio_notice if send_bio_notice is not None else True,
                         "created_at": now
                     }
                 },
@@ -209,6 +215,10 @@ class DatabaseManager:
             )
         except Exception as e:
             logger.error(f"Failed to upsert group {chat_id} in MongoDB: {e}")
+
+    async def reset_custom_bio_msg(self, chat_id: int):
+        """Resets custom bio notice to default in MongoDB."""
+        await self.set_custom_bio_msg(chat_id, None)
 
     async def add_exempt_user(
         self,
