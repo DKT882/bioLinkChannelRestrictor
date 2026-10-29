@@ -30,6 +30,7 @@ try:
 except ImportError:
     pass
 
+import aiohttp
 from aiohttp import web
 import telebot
 from telebot.async_telebot import AsyncTeleBot
@@ -2809,7 +2810,11 @@ async def main():
         logger.info("Shutting down background services...")
         prune_task.cancel()
         await web_runner.cleanup()
-        await bot.close_session()
+        try:
+            if getattr(telebot.asyncio_helper.session_manager, "session", None) is not None:
+                await bot.close_session()
+        except Exception:
+            pass
         await db_manager.close()
         logger.info("Shutdown completed cleanly.")
 
