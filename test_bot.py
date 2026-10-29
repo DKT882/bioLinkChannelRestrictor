@@ -22,7 +22,9 @@ from main import (
     http_health_handler,
     detect_chat_link,
     format_bio_delete_notice,
-    DEFAULT_BIO_DELETE_MSG
+    DEFAULT_BIO_DELETE_MSG,
+    render_groups_list,
+    render_single_group_dashboard
 )
 from telebot import types
 
@@ -274,6 +276,34 @@ class TestFreeLinksConfig(unittest.TestCase):
 
         config["free_links"].discard(user_id)
         self.assertNotIn(user_id, config["free_links"])
+
+
+class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        active_groups.clear()
+        admin_cache.clear()
+
+    async def test_no_managed_groups(self):
+        user = types.User(id=999999, is_bot=False, first_name="RandomUser")
+        text, keyboard = await render_groups_list(user)
+        self.assertIn("not currently registered as an administrator", text)
+        self.assertIsNotNone(keyboard)
+
+    async def test_managed_group_rendering(self):
+        chat_id = -10011223344
+        config = get_group_config(chat_id)
+        config["title"] = "VIP Trading Lounge"
+        admin_id = 777888999
+        admin_cache[chat_id] = ({admin_id}, time.monotonic() + 300)
+
+        user = types.User(id=admin_id, is_bot=False, first_name="Manager")
+        text, keyboard = await render_groups_list(user)
+        self.assertIn("VIP Trading Lounge", str(keyboard.to_dict()))
+
+        dash_text, dash_kb = await render_single_group_dashboard(chat_id, admin_id)
+        self.assertIn("VIP Trading Lounge", dash_text)
+        self.assertIn("Active ✅", dash_text)
+        self.assertIn(str(chat_id), dash_text)
 
 
 if __name__ == "__main__":

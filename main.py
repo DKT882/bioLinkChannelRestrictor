@@ -21,7 +21,7 @@ import time
 import json
 import asyncio
 import logging
-from typing import Dict, Set, Any, Optional, Tuple
+from typing import Dict, Set, Any, Optional, Tuple, List
 
 # Attempt to load local .env if available (for local testing)
 try:
@@ -137,7 +137,8 @@ def load_settings() -> Dict[int, Dict[str, Any]]:
                         "ignore_admins": cfg.get("ignore_admins", False),
                         "free_list": set(cfg.get("free_list", [])),
                         "free_links": set(cfg.get("free_links", [])),
-                        "custom_bio_msg": cfg.get("custom_bio_msg", None)
+                        "custom_bio_msg": cfg.get("custom_bio_msg", None),
+                        "title": cfg.get("title", "")
                     }
             logger.info(f"Loaded persistent configurations for {len(groups)} group(s).")
         except Exception as e:
@@ -158,7 +159,8 @@ def save_settings():
                 "ignore_admins": cfg.get("ignore_admins", False),
                 "free_list": list(cfg.get("free_list", set())),
                 "free_links": list(cfg.get("free_links", set())),
-                "custom_bio_msg": cfg.get("custom_bio_msg", None)
+                "custom_bio_msg": cfg.get("custom_bio_msg", None),
+                "title": cfg.get("title", "")
             }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -174,6 +176,7 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
     - free_list: set() (Bio link exemption)
     - free_links: set() (In-chat link exemption)
     - custom_bio_msg: None (Custom response notice for bio link deletion)
+    - title: "" (Cached group title)
     """
     if chat_id not in active_groups:
         active_groups[chat_id] = {
@@ -182,7 +185,8 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
             "ignore_admins": False,
             "free_list": set(),
             "free_links": set(),
-            "custom_bio_msg": None
+            "custom_bio_msg": None,
+            "title": ""
         }
         save_settings()
         if db_manager.is_connected:
@@ -199,6 +203,8 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
         cfg["free_links"] = set()
     if "custom_bio_msg" not in cfg:
         cfg["custom_bio_msg"] = None
+    if "title" not in cfg:
+        cfg["title"] = ""
     return cfg
 
 # ------------------------------------------------------------------------------
@@ -593,46 +599,180 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
 
 
 # ------------------------------------------------------------------------------
+# 5b. PRIVATE CHAT & GROUP HELP STYLE INTERACTIVE DASHBOARD
+# ------------------------------------------------------------------------------
+
+async def get_admin_managed_groups(user_id: int) -> List[Tuple[int, str, Dict[str, Any]]]:
+    """
+    Finds all active groups where user_id is an Administrator or Owner.
+    Returns list of (chat_id, title, group_config).
+    """
+    managed = []
+    for chat_id, config in list(active_groups.items()):
+        try:
+            if await is_user_admin(chat_id, user_id):
+                title = config.get("title")
+                if not title:
+                    try:
+                        chat_obj = await bot.get_chat(chat_id)
+                        title = chat_obj.title or f"Group {chat_id}"
+                        config["title"] = title
+                    except Exception:
+                        title = f"Group {chat_id}"
+                managed.append((chat_id, title, config))
+        except Exception:
+            pass
+    return managed
+
+
+async def render_groups_list(user: types.User) -> Tuple[str, types.InlineKeyboardMarkup]:
+    """
+    Builds the Group Help-style groups list message and inline keyboard in private chat.
+    """
+    first_name = html.escape(user.first_name or "Admin")
+    bot_uname = bot_metadata.get("username") or "bioLinkChannelBot"
+    managed = await get_admin_managed_groups(user.id)
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+
+    if not managed:
+        text = (
+            f"👋 <b>Hello, {first_name}!</b>\n\n"
+            f"You are not currently registered as an administrator in any connected groups.\n\n"
+            f"<b>How to connect your group:</b>\n"
+            f"1️⃣ Add @{bot_uname} to your Telegram group.\n"
+            f"2️⃣ Promote the bot to <b>Administrator</b> with permission to <i>Delete Messages</i>.\n"
+            f"3️⃣ The group will automatically appear here for you to manage!"
+        )
+        keyboard.add(
+            types.InlineKeyboardButton("➕ Add Bot to Group", url=f"https://t.me/{bot_uname}?startgroup=true"),
+            types.InlineKeyboardButton("🔄 Refresh List", callback_data="refresh_groups")
+        )
+        return text, keyboard
+
+    text = (
+        f"👋 <b>Hello, {first_name}!</b>\n\n"
+        f"Here are the groups you manage that are connected to <b>BioLink Restrictor</b>:\n"
+        f"<i>Select a group below to view its live status and protection settings:</i>"
+    )
+
+    for chat_id, title, config in managed:
+        act_status = "✅ Active" if config.get("activated", True) else "⏸️ Paused"
+        button_label = f"👥 {title} ({act_status})"
+        keyboard.add(types.InlineKeyboardButton(button_label, callback_data=f"grp_{chat_id}"))
+
+    keyboard.add(
+        types.InlineKeyboardButton("➕ Add to Another Group", url=f"https://t.me/{bot_uname}?startgroup=true"),
+        types.InlineKeyboardButton("🔄 Refresh List", callback_data="refresh_groups")
+    )
+    return text, keyboard
+
+
+async def render_single_group_dashboard(chat_id: int, user_id: int) -> Tuple[str, types.InlineKeyboardMarkup]:
+    """
+    Builds the detailed dashboard for a single group selected by the admin in private chat.
+    """
+    config = get_group_config(chat_id)
+    title = config.get("title") or f"Group {chat_id}"
+    action = config.get("action", "delete")
+    ignore_admins = config.get("ignore_admins", False)
+    bio_exempt_count = len(config.get("free_list", set()))
+    link_allowed_count = len(config.get("free_links", set()))
+    has_custom = "Customized ✅" if config.get("custom_bio_msg") else "Default (@i_am_turtle) ℹ️"
+
+    text = (
+        f"🛡️ <b>Group Dashboard: {html.escape(title)}</b>\n"
+        f"<code>ID: {chat_id}</code>\n\n"
+        f"• <b>Status:</b> <code>Active ✅ (Default)</code>\n"
+        f"• <b>Punishment Action:</b> <code>{action}</code>\n"
+        f"• <b>Filter Admins:</b> <code>{'Disabled (Admins exempt)' if ignore_admins else 'Enabled (Admins scanned too)'}</code>\n"
+        f"• <b>Bio Exempt Users (/free):</b> <code>{bio_exempt_count}</code>\n"
+        f"• <b>Link Allowed Users (/free link):</b> <code>{link_allowed_count}</code>\n"
+        f"• <b>Bio Deletion Notice:</b> <code>{has_custom}</code>\n\n"
+        f"⚙️ <b>Commands to use in the group:</b>\n"
+        f"• <code>/free &lt;user&gt;</code> - Exempt member from bio checks\n"
+        f"• <code>/free link &lt;user&gt;</code> - Permit member to send links\n"
+        f"• <code>/unfree &lt;user&gt;</code> - Revoke bio exemption\n"
+        f"• <code>/unfree link &lt;user&gt;</code> - Revoke link permission\n"
+        f"• <code>/setmsg &lt;text&gt;</code> - Customize bio notice\n"
+        f"• <code>/setaction &lt;delete|warn|mute|ban&gt;</code>\n"
+        f"• <code>/toggleadmin</code> - Toggle admin filtering"
+    )
+
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    keyboard.add(
+        types.InlineKeyboardButton("🔄 Refresh Settings", callback_data=f"grp_{chat_id}"),
+        types.InlineKeyboardButton("⬅️ Back to Groups List", callback_data="back_groups")
+    )
+    return text, keyboard
+
+
+# ------------------------------------------------------------------------------
 # 6. COMMAND HANDLERS (ADMIN ONLY)
 # ------------------------------------------------------------------------------
 
-@bot.message_handler(commands=["start"])
+@bot.callback_query_handler(func=lambda call: True)
+async def handle_dashboard_callbacks(call: types.CallbackQuery):
+    """
+    Handles interactive inline navigation in private DM (Group Help style).
+    """
+    if not call.message:
+        return
+    data = call.data
+    user = call.from_user
+
+    if data in ("refresh_groups", "back_groups"):
+        text, keyboard = await render_groups_list(user)
+        try:
+            await bot.edit_message_text(
+                text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+        except Exception:
+            pass
+        await bot.answer_callback_query(call.id)
+        return
+
+    if data.startswith("grp_"):
+        try:
+            chat_id = int(data.split("_")[1])
+            # Security verification: ensure user is an admin/owner of this group
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(
+                    call.id,
+                    "⚠️ You are no longer an administrator in this group.",
+                    show_alert=True
+                )
+                return
+
+            text, keyboard = await render_single_group_dashboard(chat_id, user.id)
+            await bot.edit_message_text(
+                text,
+                chat_id=call.message.chat.id,
+                message_id=call.message.message_id,
+                parse_mode="HTML",
+                reply_markup=keyboard
+            )
+            await bot.answer_callback_query(call.id)
+        except Exception as e:
+            logger.error(f"Error handling group callback {data}: {e}")
+            await bot.answer_callback_query(call.id, "Error loading group settings.")
+
+
+@bot.message_handler(commands=["start", "groups", "chats"])
 async def cmd_start(message: types.Message):
     """
-    /start: Displays group status (Admin Only) or DM introduction.
-    Note: The bot is ACTIVE BY DEFAULT across all groups without needing /start.
+    /start: Displays Group Help-style interactive dashboard in private DM,
+    or group status in supergroups.
     """
     chat = message.chat
 
-    # Case 1: Private DM with user
+    # Case 1: Private DM with user / admin / owner
     if chat.type == "private":
-        welcome_text = (
-            "👋 <b>Welcome to BioLink Channel Restrictor!</b>\n\n"
-            "This bot automatically keeps group chats clean by scanning members' profiles "
-            "for promotional URLs, link aggregators, channel @handles, and <b>connected channels</b>, "
-            "as well as blocking unauthorized in-chat links, forwards, and bot mentions.\n\n"
-            "<b>Default Protection:</b>\n"
-            "• Active by default in every group (no setup needed).\n"
-            "• Automatically deletes messages from users AND admins with bio links or connected channels.\n"
-            "• Automatically deletes all unauthorized in-chat links, forwards, and bot mentions.\n\n"
-            "<b>Setup Instructions:</b>\n"
-            "1️⃣ Add this bot to your Telegram Group.\n"
-            "2️⃣ Promote it to <b>Administrator</b> with permissions to <i>Delete Messages</i> "
-            "(and <i>Ban/Restrict Users</i> if you plan to mute or ban).\n"
-            "3️⃣ Protection is instantly live!\n\n"
-            "<b>Admin Commands:</b>\n"
-            "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code> - Configure punishment (Default: delete)\n"
-            "• <code>/toggleadmin</code> - Toggle whether admins are scanned (Default: False / Admins are scanned)\n"
-            "• <code>/free &lt;reply or @user&gt;</code> - Exempt bio links (Owner/Anon Admin only)\n"
-            "• <code>/free link &lt;reply or @user&gt;</code> - Permit sending links in chat (Owner/Anon Admin only)\n"
-            "• <code>/unfree &lt;reply or @user&gt;</code> - Remove bio exemption (Owner/Anon Admin only)\n"
-            "• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link permission (Owner/Anon Admin only)\n"
-            "• <code>/setmsg &lt;text&gt;</code> - Customize bio deletion response message\n"
-            "• <code>/resetmsg</code> - Reset bio deletion notice to default\n"
-            "• <code>/getmsg</code> - View current bio deletion notice\n"
-            "• <code>/status</code> - View current group configuration"
-        )
-        await bot.reply_to(message, welcome_text, parse_mode="HTML")
+        text, keyboard = await render_groups_list(message.from_user)
+        await bot.send_message(chat.id, text, parse_mode="HTML", reply_markup=keyboard)
         return
 
     # Case 2: Group / Supergroup
@@ -1269,6 +1409,20 @@ async def cmd_help(message: types.Message):
         asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 30))
 
 
+@bot.message_handler(func=lambda msg: msg.chat.type == "private", content_types=["text"])
+async def handle_private_message(message: types.Message):
+    """
+    If any admin, anonymous admin, or owner sends a private message to the bot,
+    the bot returns the Group Help-style interactive dashboard
+    showing all connected groups where the user is an administrator.
+    """
+    if message.text and message.text.startswith("/"):
+        # Let command handlers process commands
+        return
+    text, keyboard = await render_groups_list(message.from_user)
+    await bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=keyboard)
+
+
 # ------------------------------------------------------------------------------
 # 7. ANTIGRAVITY / SPAM FILTER ENGINE
 # ------------------------------------------------------------------------------
@@ -1304,6 +1458,13 @@ async def process_chat_message(message: types.Message):
     group_config = get_group_config(chat_id)
     if not group_config.get("activated", True):
         return
+
+    # Track group title
+    if message.chat.title and group_config.get("title") != message.chat.title:
+        group_config["title"] = message.chat.title
+        save_settings()
+        if db_manager.is_connected:
+            asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, title=message.chat.title))
 
     # Track username to user_id mapping dynamically for /free lookup
     if message.from_user and message.from_user.username:

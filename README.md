@@ -43,7 +43,14 @@ It actively protects Telegram groups against spam bots, promotion accounts, and 
 - **`/status`**: Displays a real-time configuration dashboard of the group.
 - **`/help`**: Lists available commands and usage instructions.
 
-### 3. Exemption Commands (`/free` & `/unfree`)
+### 3. Private DM Group Management (Group Help Bot Style)
+- When any **Administrator, Group Owner, or Anonymous Admin** messages the bot in Private Chat (DM) or sends `/start`, `/groups`, or `/chats`:
+  - The bot automatically scans all active groups connected to this bot.
+  - Generates an interactive inline keyboard listing all groups managed by that admin: `[ 👥 Group Title (✅ Active) ]`.
+  - Tapping any group button loads a full live dashboard for that specific group (Status, Action, Admin Filtering, Bio Exempt Users, Link Allowed Users, and Notice Status) with `[ 🔄 Refresh ]` and `[ ⬅️ Back ]` buttons.
+  - If a user is not yet an admin in any group, it provides a one-click `[ ➕ Add Bot to Group ]` link.
+
+### 4. Exemption Commands (`/free` & `/unfree`)
 - **Restricted To**: **Group Owner (Creator)** and **Anonymous Admin** only.
 - **Two Distinct Exemption Tiers**:
   1. **Bio Link Exemption (`/free` & `/unfree`)**:
