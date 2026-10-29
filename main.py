@@ -138,7 +138,9 @@ def load_settings() -> Dict[int, Dict[str, Any]]:
                         "free_list": set(cfg.get("free_list", [])),
                         "free_links": set(cfg.get("free_links", [])),
                         "custom_bio_msg": cfg.get("custom_bio_msg", None),
-                        "title": cfg.get("title", "")
+                        "title": cfg.get("title", ""),
+                        "filter_links": cfg.get("filter_links", True),
+                        "filter_bio": cfg.get("filter_bio", True)
                     }
             logger.info(f"Loaded persistent configurations for {len(groups)} group(s).")
         except Exception as e:
@@ -160,7 +162,9 @@ def save_settings():
                 "free_list": list(cfg.get("free_list", set())),
                 "free_links": list(cfg.get("free_links", set())),
                 "custom_bio_msg": cfg.get("custom_bio_msg", None),
-                "title": cfg.get("title", "")
+                "title": cfg.get("title", ""),
+                "filter_links": cfg.get("filter_links", True),
+                "filter_bio": cfg.get("filter_bio", True)
             }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -177,6 +181,8 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
     - free_links: set() (In-chat link exemption)
     - custom_bio_msg: None (Custom response notice for bio link deletion)
     - title: "" (Cached group title)
+    - filter_links: True (In-chat links blocked by default)
+    - filter_bio: True (Bio & channel links blocked by default)
     """
     if chat_id not in active_groups:
         active_groups[chat_id] = {
@@ -186,7 +192,9 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
             "free_list": set(),
             "free_links": set(),
             "custom_bio_msg": None,
-            "title": ""
+            "title": "",
+            "filter_links": True,
+            "filter_bio": True
         }
         save_settings()
         if db_manager.is_connected:
@@ -194,7 +202,9 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
                 chat_id=chat_id,
                 activated=True,
                 action="delete",
-                ignore_admins=False
+                ignore_admins=False,
+                filter_links=True,
+                filter_bio=True
             ))
     cfg = active_groups[chat_id]
     if "free_list" not in cfg:
@@ -205,6 +215,10 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
         cfg["custom_bio_msg"] = None
     if "title" not in cfg:
         cfg["title"] = ""
+    if "filter_links" not in cfg:
+        cfg["filter_links"] = True
+    if "filter_bio" not in cfg:
+        cfg["filter_bio"] = True
     return cfg
 
 # ------------------------------------------------------------------------------
@@ -719,9 +733,14 @@ def render_group_settings_grid(chat_id: int) -> Tuple[str, types.InlineKeyboardM
 
     markup = types.InlineKeyboardMarkup(row_width=2)
 
-    # Row 1: Bio & Channel restriction | In-Chat Links restriction
-    btn_bio = types.InlineKeyboardButton("📜 Bio & Channel", callback_data=f"sub_bio_{chat_id}")
-    btn_chat_links = types.InlineKeyboardButton("📨 In-Chat Links", callback_data=f"sub_links_{chat_id}")
+    # Row 1: Bio & Channel restriction toggle | In-Chat Links restriction toggle
+    filter_bio = config.get("filter_bio", True)
+    filter_links = config.get("filter_links", True)
+    bio_label = "📜 Bio & Channel: ON" if filter_bio else "📜 Bio & Channel: OFF"
+    links_label = "📨 In-Chat Links: ON" if filter_links else "📨 In-Chat Links: OFF"
+
+    btn_bio = types.InlineKeyboardButton(bio_label, callback_data=f"toggle_bio_{chat_id}")
+    btn_chat_links = types.InlineKeyboardButton(links_label, callback_data=f"toggle_links_{chat_id}")
     markup.row(btn_bio, btn_chat_links)
 
     # Row 2: Punishment action cycler | Admin filter toggle
@@ -764,24 +783,34 @@ def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.InlineKe
     markup.add(types.InlineKeyboardButton("⬅️ Back to Settings", callback_data=f"grp_{chat_id}"))
 
     if sub_type == "bio":
+        filter_bio = config.get("filter_bio", True)
+        status_str = "Active ✅ (Default)" if filter_bio else "Disabled ❌ (Off)"
+        action_str = "Violating messages are deleted immediately + a 30s notice is sent." if filter_bio else "Disabled (Users with links/channels in bio are allowed to chat)."
         text = (
             f"📜 <b>Bio & Connected Channel Scanner</b>\n"
             f"<b>Group:</b> {html.escape(title)}\n\n"
-            f"• <b>Status:</b> <code>Active ✅ (Default)</code>\n"
+            f"• <b>Status:</b> <code>{status_str}</code>\n"
             f"• <b>Connected Channels:</b> Scans Telegram <code>personal_chat</code> on user profiles.\n"
             f"• <b>Profile Bios:</b> Scans for URLs, website links, and @channel handles.\n"
-            f"• <b>Action:</b> Violating messages are deleted immediately + a 30s notice is sent.\n\n"
-            f"<i>Admins and members with bio links are blocked unless exempted with /free.</i>"
+            f"• <b>Action:</b> {action_str}\n\n"
+            f"<i>Admins and members with bio links are blocked unless exempted with /free when filter is ON.</i>"
         )
+        toggle_btn_text = "🔴 Turn Filter OFF" if filter_bio else "🟢 Turn Filter ON"
+        markup.add(types.InlineKeyboardButton(toggle_btn_text, callback_data=f"toggle_bio_{chat_id}"))
     elif sub_type == "links":
+        filter_links = config.get("filter_links", True)
+        status_str = "Active ✅ (Default)" if filter_links else "Disabled ❌ (Off)"
+        action_str = "Silently deleted immediately with ZERO spam notification." if filter_links else "Disabled (All group members are allowed to send links)."
         text = (
             f"📨 <b>In-Chat Links & Forwards Filter</b>\n"
             f"<b>Group:</b> {html.escape(title)}\n\n"
-            f"• <b>Status:</b> <code>Active ✅ (Default)</code>\n"
+            f"• <b>Status:</b> <code>{status_str}</code>\n"
             f"• <b>Prohibited Content:</b> Web links, inline links, forwarded messages from {{users, bots, channels, groups}}, and external bot mentions.\n"
-            f"• <b>Action:</b> Silently deleted immediately with ZERO spam notification.\n\n"
-            f"<i>Only users granted permission with /free link or the Group Owner can send links.</i>"
+            f"• <b>Action:</b> {action_str}\n\n"
+            f"<i>Only users granted permission with /free link or the Group Owner can send links when filter is ON.</i>"
         )
+        toggle_btn_text = "🔴 Turn Filter OFF" if filter_links else "🟢 Turn Filter ON"
+        markup.add(types.InlineKeyboardButton(toggle_btn_text, callback_data=f"toggle_links_{chat_id}"))
     elif sub_type == "free":
         free_list = config.get("free_list", set())
         users_str = ", ".join(f"<code>{uid}</code>" for uid in list(free_list)[:15]) or "<i>None</i>"
@@ -1018,6 +1047,66 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
             await bot.answer_callback_query(call.id, "Could not toggle admin setting.")
         return
 
+    # 8b. Toggle In-Chat Links Filter
+    if data.startswith("toggle_links_"):
+        try:
+            chat_id = int(data.split("_")[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            config = get_group_config(chat_id)
+            new_state = not config.get("filter_links", True)
+            config["filter_links"] = new_state
+            save_settings()
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, filter_links=new_state))
+
+            # If user is in the sub-screen, re-render sub-screen; else re-render settings grid
+            msg_text = call.message.text or ""
+            if "In-Chat Links" in msg_text:
+                text, markup = render_sub_setting(chat_id, "links")
+            else:
+                text, markup = render_group_settings_grid(chat_id)
+
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            notice = "📨 In-Chat Links: ON (Blocked)" if new_state else "📨 In-Chat Links: OFF (Allowed)"
+            await bot.answer_callback_query(call.id, notice)
+        except Exception as e:
+            logger.error(f"Error toggling link filter: {e}")
+            await bot.answer_callback_query(call.id, "Could not toggle link filter.")
+        return
+
+    # 8c. Toggle Bio & Channel Filter
+    if data.startswith("toggle_bio_"):
+        try:
+            chat_id = int(data.split("_")[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            config = get_group_config(chat_id)
+            new_state = not config.get("filter_bio", True)
+            config["filter_bio"] = new_state
+            save_settings()
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, filter_bio=new_state))
+
+            # If user is in the sub-screen, re-render sub-screen; else re-render settings grid
+            msg_text = call.message.text or ""
+            if "Bio & Connected Channel" in msg_text:
+                text, markup = render_sub_setting(chat_id, "bio")
+            else:
+                text, markup = render_group_settings_grid(chat_id)
+
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            notice = "📜 Bio Filter: ON (Blocked)" if new_state else "📜 Bio Filter: OFF (Allowed)"
+            await bot.answer_callback_query(call.id, notice)
+        except Exception as e:
+            logger.error(f"Error toggling bio filter: {e}")
+            await bot.answer_callback_query(call.id, "Could not toggle bio filter.")
+        return
+
     # 9. Sub-setting Views (sub_bio, sub_links, sub_free, sub_freel, sub_notice, sub_delmsg, sub_promo, sub_apprv)
     if data.startswith("sub_"):
         try:
@@ -1084,33 +1173,21 @@ async def cmd_start(message: types.Message):
     # Invalidate cached admins to ensure fresh state
     admin_cache.pop(chat_id, None)
 
-    action = group_config.get("action", "delete")
-    ignore_admins = group_config.get("ignore_admins", False)
-    free_count = len(group_config.get("free_list", set()))
-    link_count = len(group_config.get("free_links", set()))
+    bot_uname = bot_metadata.get("username") or "bioLinkChannelBot"
+    settings_url = f"https://t.me/{bot_uname}?start=settings_{chat_id}"
+    markup = types.InlineKeyboardMarkup()
+    markup.add(types.InlineKeyboardButton("⚙️ Open in pvt ↗", url=settings_url))
 
-    activation_text = (
-        "🛡️ <b>BioLink Protection is Active!</b>\n\n"
-        "All messages are actively filtered for promotional links, website domains, connected channels, "
-        "and unauthorized chat links.\n\n"
-        "<b>Current Configuration:</b>\n"
-        "• <b>Status:</b> Active ✅ (Default)\n"
-        f"• <b>Action:</b> <code>{action}</code>\n"
-        f"• <b>Filter Admins:</b> <code>{'Disabled (Admins exempt)' if ignore_admins else 'Enabled (Admins are scanned & deleted too)'}</code>\n"
-        f"• <b>Bio Exempt Users (/free):</b> <code>{free_count}</code>\n"
-        f"• <b>Link Allowed Users (/free link):</b> <code>{link_count}</code>\n\n"
-        "<b>Commands:</b>\n"
-        "• <code>/free &lt;reply or @user&gt;</code> - Exempt bio links (Owner/Anon Admin only)\n"
-        "• <code>/free link &lt;reply or @user&gt;</code> - Permit sending links (Owner/Anon Admin only)\n"
-        "• <code>/unfree &lt;reply or @user&gt;</code> - Revoke bio exemption\n"
-        "• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link permission\n"
-        "• <code>/setmsg &lt;text&gt;</code> - Customize bio delete message\n"
-        "• <code>/resetmsg</code> - Reset bio message to default\n"
-        "• <code>/status</code> - View full configuration"
+    title = chat.title or "this group"
+    reply_msg = await bot.reply_to(
+        message,
+        f"⚙️ <b>Settings for {html.escape(title)}</b>\n\n"
+        f"👉 Tap the button below to manage this group's settings in private:",
+        parse_mode="HTML",
+        reply_markup=markup
     )
-    reply_msg = await bot.reply_to(message, activation_text, parse_mode="HTML")
-    asyncio.create_task(auto_delete_message(chat_id, reply_msg.message_id, 25))
-    logger.info(f"Group {chat_id} ({chat.title}) verified by user {user_id}")
+    asyncio.create_task(auto_delete_message(chat_id, reply_msg.message_id, 30))
+    logger.info(f"Group {chat_id} ({chat.title}) settings opened by user {user_id}")
 
 
 @bot.message_handler(commands=["setaction"])
@@ -1867,66 +1944,68 @@ async def process_chat_message(message: types.Message):
     # --------------------------------------------------------------------------
     # Check 1: In-Chat Link & Forward Restriction
     # --------------------------------------------------------------------------
-    has_chat_link, link_reason = detect_chat_link(message)
-    if has_chat_link:
-        free_links: Set[int] = group_config.get("free_links", set())
-        is_link_allowed = (user_id in free_links)
+    if group_config.get("filter_links", True):
+        has_chat_link, link_reason = detect_chat_link(message)
+        if has_chat_link:
+            free_links: Set[int] = group_config.get("free_links", set())
+            is_link_allowed = (user_id in free_links)
 
-        if not is_link_allowed:
-            # Check if user is Group Owner or Anonymous Admin
-            if await is_owner_or_anonymous_admin(chat_id, user_id, message):
-                is_link_allowed = True
-            elif group_config.get("ignore_admins", False):
-                if await is_user_admin(chat_id, user_id, message):
+            if not is_link_allowed:
+                # Check if user is Group Owner or Anonymous Admin
+                if await is_owner_or_anonymous_admin(chat_id, user_id, message):
                     is_link_allowed = True
+                elif group_config.get("ignore_admins", False):
+                    if await is_user_admin(chat_id, user_id, message):
+                        is_link_allowed = True
 
-        if not is_link_allowed:
-            # User requirement: Silently delete message; DO NOT send response mention notice
-            try:
-                await bot.delete_message(chat_id, message.message_id)
-            except TELEGRAM_EXCEPTIONS as e:
-                logger.warning(f"Could not delete restricted link message {message.message_id} in {chat_id}: {e}")
+            if not is_link_allowed:
+                # User requirement: Silently delete message; DO NOT send response mention notice
+                try:
+                    await bot.delete_message(chat_id, message.message_id)
+                except TELEGRAM_EXCEPTIONS as e:
+                    logger.warning(f"Could not delete restricted link message {message.message_id} in {chat_id}: {e}")
 
-            if db_manager.is_connected:
-                msg_content = message.text or message.caption or ""
-                asyncio.create_task(db_manager.log_moderation_event(
-                    chat_id=chat_id,
-                    user_id=user_id,
-                    username=message.from_user.username or "",
-                    first_name=message.from_user.first_name or "",
-                    is_admin=False,
-                    violation_type="chat_link",
-                    violation_detail=link_reason,
-                    action_taken="delete",
-                    message_text=msg_content
-                ))
-            return
+                if db_manager.is_connected:
+                    msg_content = message.text or message.caption or ""
+                    asyncio.create_task(db_manager.log_moderation_event(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        username=message.from_user.username or "",
+                        first_name=message.from_user.first_name or "",
+                        is_admin=False,
+                        violation_type="chat_link",
+                        violation_detail=link_reason,
+                        action_taken="delete",
+                        message_text=msg_content
+                    ))
+                return
 
     # --------------------------------------------------------------------------
     # Check 2: Profile Bio & Connected Channel Restriction
     # --------------------------------------------------------------------------
-    # Fast Check 2a: Bio Exemption List (/free)
-    free_list: Set[int] = group_config.get("free_list", set())
-    if user_id in free_list:
-        return
-
-    # Fast Check 2b: Skip admins ONLY IF ignore_admins is True (Default: False / Admins are scanned)
-    if group_config.get("ignore_admins", False):
-        if await is_user_admin(chat_id, user_id, message):
+    if group_config.get("filter_bio", True):
+        # Fast Check 2a: Bio Exemption List (/free)
+        free_list: Set[int] = group_config.get("free_list", set())
+        if user_id in free_list:
             return
 
-    # Fast Check 2c: Group Owner is always exempt from bio scan
-    if await is_owner_or_anonymous_admin(chat_id, user_id, message):
-        return
+        # Fast Check 2b: Skip admins ONLY IF ignore_admins is True (Default: False / Admins are scanned)
+        if group_config.get("ignore_admins", False):
+            if await is_user_admin(chat_id, user_id, message):
+                return
 
-    # Bio & Connected Channel Scan
-    has_violation, reason = await scan_user_bio(user_id)
-    if not has_violation:
-        return
+        # Fast Check 2c: Group Owner is always exempt from bio scan
+        if await is_owner_or_anonymous_admin(chat_id, user_id, message):
+            return
 
-    # Action Trigger: User or Admin has a link, handle, or connected channel!
-    configured_action = group_config.get("action", "delete")
-    asyncio.create_task(execute_action(message, configured_action, reason))
+        # Bio & Connected Channel Scan
+        has_violation, reason = await scan_user_bio(user_id)
+        if not has_violation:
+            return
+
+        # Action Trigger: User or Admin has a link, handle, or connected channel!
+        configured_action = group_config.get("action", "delete")
+        asyncio.create_task(execute_action(message, configured_action, reason))
 
 
 # ------------------------------------------------------------------------------

@@ -344,6 +344,36 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
             self.assertIn("Crypto Elite", sub_text)
             self.assertIn("Back to Settings", str(sub_kb.to_dict()))
 
+    async def test_toggle_links_and_bio_filters(self):
+        chat_id = -10011223344
+        config = get_group_config(chat_id)
+
+        # Default state: both ON
+        self.assertTrue(config["filter_links"])
+        self.assertTrue(config["filter_bio"])
+
+        _, kb_on = render_group_settings_grid(chat_id)
+        kb_dict = str(kb_on.to_dict())
+        self.assertIn("In-Chat Links: ON", kb_dict)
+        self.assertIn("Bio & Channel: ON", kb_dict)
+
+        # Sub-view has Turn Filter OFF button
+        _, sub_kb = render_sub_setting(chat_id, "links")
+        self.assertIn("Turn Filter OFF", str(sub_kb.to_dict()))
+
+        # Toggle OFF
+        config["filter_links"] = False
+        config["filter_bio"] = False
+
+        _, kb_off = render_group_settings_grid(chat_id)
+        kb_off_dict = str(kb_off.to_dict())
+        self.assertIn("In-Chat Links: OFF", kb_off_dict)
+        self.assertIn("Bio & Channel: OFF", kb_off_dict)
+
+        # Sub-view has Turn Filter ON button
+        _, sub_kb_off = render_sub_setting(chat_id, "links")
+        self.assertIn("Turn Filter ON", str(sub_kb_off.to_dict()))
+
 
 if __name__ == "__main__":
     unittest.main()
