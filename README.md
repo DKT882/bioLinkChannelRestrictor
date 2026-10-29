@@ -64,7 +64,7 @@ It actively protects Telegram groups against spam bots, promotion accounts, and 
 - **Check 2: Profile Bio & Connected Channel Filter**:
   - Inspects `personal_chat` (connected channel) and `chat.bio` / `business_intro`.
   - Violating messages are deleted immediately.
-  - An informative response notice is sent tagging the user and directing them to contact `@i_am_turtle` for approval (auto-deleted after 15s).
+  - An informative response notice is sent tagging the user and directing them to contact `@i_am_turtle` for approval (auto-deleted after 30s).
 - **Check 3: Administrator Filtering**:
   - Admins are scanned by default unless `/toggleadmin` is toggled.
   - Group Owner and Anonymous Admin are always exempt.

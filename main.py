@@ -541,7 +541,7 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
     notice_text = format_bio_delete_notice(custom_msg, user)
     try:
         notice_msg = await bot.send_message(chat_id, notice_text, parse_mode="HTML")
-        asyncio.create_task(auto_delete_message(chat_id, notice_msg.message_id, delay_seconds=15))
+        asyncio.create_task(auto_delete_message(chat_id, notice_msg.message_id, delay_seconds=30))
     except Exception as e:
         logger.warning(f"Could not deliver bio violation notice in {chat_id}: {e}")
 
