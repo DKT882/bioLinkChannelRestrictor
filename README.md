@@ -30,33 +30,44 @@ It actively protects Telegram groups against spam bots, promotion accounts, and 
 - **Settings Persistence**: Saves configurations and exemption lists to `settings.json` so custom settings survive redeployments.
 
 ### 2. Administrator Feature Controls
+- **Admin Command Cleanup**: All admin/owner command messages are automatically deleted within 3 seconds to maintain a clean chat history.
 - **`/setaction <delete|warn|mute|ban>`**: Configures the punishment applied when a user/admin has a bio link or connected channel:
-  - `delete`: Silently deletes the violating message (Default).
-  - `warn`: Deletes the message and sends a warning in the group (auto-deleted after 12s to prevent chat clutter).
-  - `mute`: Deletes the message and restricts the user from sending messages in the chat.
-  - `ban`: Deletes the message and permanently bans the user from the group.
+  - `delete`: Deletes violating message & sends notification to contact `@i_am_turtle` (Default).
+  - `warn`: Deletes message and warns user in chat.
+  - `mute`: Deletes message and mutes user from sending messages.
+  - `ban`: Deletes message and permanently bans user from group.
 - **`/toggleadmin`**: Toggles whether group administrators are exempted (Default: `False` / admins are scanned and deleted too).
+- **`/setmsg <text>`**: Customizes the bio deletion notice. Supports `{mention}`, `{name}`, `{id}` placeholders.
+- **`/resetmsg`**: Restores the bio deletion notice to the default message directing to `@i_am_turtle`.
+- **`/getmsg`**: Previews the active bio deletion notice message.
 - **`/status`**: Displays a real-time configuration dashboard of the group.
 - **`/help`**: Lists available commands and usage instructions.
 
-### 3. Exemption Command (`/free` & `/unfree`)
+### 3. Exemption Commands (`/free` & `/unfree`)
 - **Restricted To**: **Group Owner (Creator)** and **Anonymous Admin** only.
-- **Applies To**: Works for regular members as well as group administrators.
-- **`/free`**:
-  - Reply to any message: `/free`
-  - Mention handle: `/free @username`
-  - Direct user ID: `/free 123456789`
-  - Adds the target ID to the chat's exemption list.
-- **`/unfree`**:
-  - Removes a user or admin from the chat's exemption list.
+- **Two Distinct Exemption Tiers**:
+  1. **Bio Link Exemption (`/free` & `/unfree`)**:
+     - Allows a user/admin whose profile bio contains URLs, handles, or connected channels to chat.
+     - *Does NOT grant permission to send links/forwards in the group.*
+     - Usage: `/free` (reply to message), `/free @username`, or `/free <user_id>`.
+     - Revocation: `/unfree` (reply to message) or `/unfree @username`.
+  2. **In-Chat Link & Forward Permission (`/free link` & `/unfree link`)**:
+     - Authorizes a trusted member or admin to send web links, inline links, forwards, and bot mentions.
+     - Usage: `/free link` (reply to message), `/free link @username`, or `/free link <user_id>`.
+     - Revocation: `/unfree link` (reply to message) or `/unfree link @username`.
 
 ### 4. Anti-Spam / Filter Engine
-- Intercepts all incoming and edited messages across all media types.
-- **Check 1: Connected Channel Detection**: Inspects `personal_chat` on the user's profile. If the user or admin has attached a personal Telegram channel to their profile, their message is deleted immediately!
-- **Check 2: Bio & Profile Links**: Inspects `chat.bio` and `business_intro` using a comprehensive regex covering `http://`, `https://`, `t.me/`, website domains (`.com`, `.net`, `.xyz`, etc.), link aggregators (`bio.link`, `linktr.ee`, `taplink.cc`), and `@channel` handles.
-- **Check 3: Exemption Check**: Bypasses anyone on the chat's `/free` list.
-- **Check 4: Admin Filtering**: Admins are filtered by default unless `/toggleadmin` is used.
-- **Action Trigger**: Deletes message (or warns/mutes/bans) asynchronously with sub-millisecond return.
+- **Check 1: In-Chat Link & Forward Filter**:
+  - Intercepts all messages containing URLs, inline links (`[click here](...)`), external `@bot` mentions, markdown/HTML table links, and **forwarded messages** from `{user, bot, channel, group}`.
+  - Unless exempted via `/free link` (or Group Owner / Anon Admin), the message is **silently deleted immediately**.
+  - **No response mention message is sent** for chat link violations (preventing chat spam).
+- **Check 2: Profile Bio & Connected Channel Filter**:
+  - Inspects `personal_chat` (connected channel) and `chat.bio` / `business_intro`.
+  - Violating messages are deleted immediately.
+  - An informative response notice is sent tagging the user and directing them to contact `@i_am_turtle` for approval (auto-deleted after 15s).
+- **Check 3: Administrator Filtering**:
+  - Admins are scanned by default unless `/toggleadmin` is toggled.
+  - Group Owner and Anonymous Admin are always exempt.
 
 ---
 
@@ -95,8 +106,10 @@ The bot operates a **Hybrid Write-Through Cache**:
 - `activated`: `bool` (Default: `true`)
 - `action`: `string` ("delete" | "warn" | "mute" | "ban", Default: `"delete"`)
 - `ignore_admins`: `bool` (Default: `false`)
-- `free_list`: `Array[int64]` (Indexed array of exempt user IDs)
-- `exemptions_detail`: `Array[Object]` (`user_id`, `username`, `freed_by`, `freed_at`)
+- `free_list`: `Array[int64]` (Indexed array of bio-exempt user IDs)
+- `free_links`: `Array[int64]` (Indexed array of link-authorized user IDs)
+- `custom_bio_msg`: `string | null` (Customizable bio deletion response notice)
+- `exemptions_detail`: `Array[Object]` (`user_id`, `username`, `type: 'bio'|'link'`, `freed_by`, `freed_at`)
 - `updated_at`: `ISODate`
 
 ### 2. `moderation_logs` Collection (Audit Trail)
@@ -105,8 +118,8 @@ The bot operates a **Hybrid Write-Through Cache**:
 - `user_id`: `int64` (Violating user ID)
 - `username`: `string`
 - `first_name`: `string`
-- `violation_type`: `"connected_channel"` | `"bio_link"`
-- `violation_detail`: Matched URL or connected channel handle
+- `violation_type`: `"connected_channel"` | `"bio_link"` | `"chat_link"`
+- `violation_detail`: Matched URL, forward type, or connected channel handle
 - `action_taken`: `"delete"` | `"warn"` | `"mute"` | `"ban"`
 - `created_at`: `ISODate` (**90-Day TTL Index**: Automatically purges old logs to conserve free tier storage!)
 
@@ -115,6 +128,7 @@ The bot operates a **Hybrid Write-Through Cache**:
 - `total_violations_handled`: `int64`
 - `total_connected_channels_caught`: `int64`
 - `total_bio_links_caught`: `int64`
+- `total_chat_links_caught`: `int64`
 - `last_heartbeat`: `ISODate`
 
 ---

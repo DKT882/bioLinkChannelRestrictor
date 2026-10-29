@@ -135,7 +135,9 @@ def load_settings() -> Dict[int, Dict[str, Any]]:
                         "activated": cfg.get("activated", True),
                         "action": cfg.get("action", "delete"),
                         "ignore_admins": cfg.get("ignore_admins", False),
-                        "free_list": set(cfg.get("free_list", []))
+                        "free_list": set(cfg.get("free_list", [])),
+                        "free_links": set(cfg.get("free_links", [])),
+                        "custom_bio_msg": cfg.get("custom_bio_msg", None)
                     }
             logger.info(f"Loaded persistent configurations for {len(groups)} group(s).")
         except Exception as e:
@@ -154,7 +156,9 @@ def save_settings():
                 "activated": cfg.get("activated", True),
                 "action": cfg.get("action", "delete"),
                 "ignore_admins": cfg.get("ignore_admins", False),
-                "free_list": list(cfg.get("free_list", set()))
+                "free_list": list(cfg.get("free_list", set())),
+                "free_links": list(cfg.get("free_links", set())),
+                "custom_bio_msg": cfg.get("custom_bio_msg", None)
             }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -167,14 +171,18 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
     - activated: True (Active by default across all groups, no /start needed!)
     - action: 'delete' (Delete violating messages by default)
     - ignore_admins: False (Scan & delete messages of admins with bio links/channels too)
-    - free_list: set()
+    - free_list: set() (Bio link exemption)
+    - free_links: set() (In-chat link exemption)
+    - custom_bio_msg: None (Custom response notice for bio link deletion)
     """
     if chat_id not in active_groups:
         active_groups[chat_id] = {
             "activated": True,
             "action": "delete",
             "ignore_admins": False,
-            "free_list": set()
+            "free_list": set(),
+            "free_links": set(),
+            "custom_bio_msg": None
         }
         save_settings()
         if db_manager.is_connected:
@@ -184,7 +192,14 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
                 action="delete",
                 ignore_admins=False
             ))
-    return active_groups[chat_id]
+    cfg = active_groups[chat_id]
+    if "free_list" not in cfg:
+        cfg["free_list"] = set()
+    if "free_links" not in cfg:
+        cfg["free_links"] = set()
+    if "custom_bio_msg" not in cfg:
+        cfg["custom_bio_msg"] = None
+    return cfg
 
 # ------------------------------------------------------------------------------
 # 4. INITIALIZE ASYNC TELEBOT
@@ -395,6 +410,89 @@ def get_user_mention(user: types.User) -> str:
     return f'<a href="tg://user?id={user.id}">{first_name}</a>'
 
 
+DEFAULT_BIO_DELETE_MSG = (
+    "⚠️ {mention}, your message was deleted because your Telegram bio contains a link "
+    "or a connected channel.\n\n"
+    "Please remove it from your profile or contact @i_am_turtle for approval."
+)
+
+def format_bio_delete_notice(template: Optional[str], user: types.User) -> str:
+    """
+    Formats the bio violation notification message with proper HTML escaping
+    and placeholder interpolation ({mention}, {name}, {id}).
+    """
+    mention = get_user_mention(user)
+    tmpl = (template or DEFAULT_BIO_DELETE_MSG).strip()
+    first_name = html.escape(user.first_name or "")
+    user_id_str = str(user.id)
+
+    if "{mention}" in tmpl or "{name}" in tmpl or "{id}" in tmpl:
+        formatted = tmpl.replace("{mention}", mention).replace("{name}", first_name).replace("{id}", user_id_str)
+    else:
+        formatted = f"{mention}\n\n{tmpl}"
+    return formatted
+
+
+def schedule_command_cleanup(message: types.Message, delay: int = 3):
+    """
+    Automatically deletes admin/owner/anonymous command message after a quick delay (e.g. 3s).
+    Keeps group chat history spotless and uncluttered.
+    """
+    if message and message.chat and message.chat.type in ("group", "supergroup"):
+        asyncio.create_task(auto_delete_message(message.chat.id, message.message_id, delay_seconds=delay))
+
+
+CHAT_MARKDOWN_LINK_REGEX = re.compile(r'\[.*?\]\(https?://\S+\)', re.IGNORECASE)
+CHAT_HTML_LINK_REGEX = re.compile(r'<a\s+[^>]*href=["\']https?://', re.IGNORECASE)
+
+def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
+    """
+    Ultra-fast scanner for in-chat links, forwards, mentions, and external bot links.
+    Returns (has_link: bool, reason: str).
+    """
+    # 1. Forward check (from user, bot, channel, group, hidden sender, or forward_origin)
+    if message.forward_date is not None:
+        return True, "Forwarded message"
+    if getattr(message, "forward_from", None) is not None:
+        return True, "Forwarded message (from user/bot)"
+    if getattr(message, "forward_from_chat", None) is not None:
+        return True, "Forwarded message (from channel/group)"
+    if getattr(message, "forward_sender_name", None) is not None:
+        return True, "Forwarded message (from hidden sender)"
+    if getattr(message, "forward_origin", None) is not None:
+        return True, "Forwarded message (forward_origin)"
+
+    # 2. Telegram pre-parsed message entities & caption entities (takes microseconds)
+    entities = (message.entities or []) + (message.caption_entities or [])
+    if entities:
+        for ent in entities:
+            e_type = ent.type
+            if e_type in ("url", "text_link"):
+                return True, f"Link entity ({e_type})"
+            if e_type in ("mention", "text_mention"):
+                return True, f"Mention entity ({e_type})"
+            if e_type == "custom_emoji":
+                return True, "Custom emoji link"
+
+    # 3. Raw text and caption inspection (pre-filter to avoid unnecessary regex)
+    combined_text = ""
+    if message.text:
+        combined_text += message.text + " "
+    if message.caption:
+        combined_text += message.caption
+
+    if combined_text:
+        if any(ch in combined_text for ch in (".", ":", "/", "@", "[", "<")):
+            if BIO_LINK_REGEX.search(combined_text):
+                return True, "URL or handle in message"
+            if CHAT_MARKDOWN_LINK_REGEX.search(combined_text):
+                return True, "Markdown link in message"
+            if CHAT_HTML_LINK_REGEX.search(combined_text):
+                return True, "HTML link in message"
+
+    return False, ""
+
+
 async def auto_delete_message(chat_id: int, message_id: int, delay_seconds: int = 12):
     """Asynchronously deletes a message after a delay to keep the chat clean."""
     try:
@@ -407,6 +505,7 @@ async def auto_delete_message(chat_id: int, message_id: int, delay_seconds: int 
 async def execute_action(message: types.Message, action: str, reason: str = ""):
     """
     Executes the configured action (delete, warn, mute, ban) against a violating user/admin.
+    Sends customizable mentioned notice directing to @i_am_turtle.
     """
     chat_id = message.chat.id
     user = message.from_user
@@ -436,20 +535,24 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
             message_text=msg_content
         ))
 
-    # If action is 'delete', we are done (silently deleted)
+    # Step 2: Send mentioned notice explaining the bio/channel deletion and approval contact (@i_am_turtle)
+    group_config = get_group_config(chat_id)
+    custom_msg = group_config.get("custom_bio_msg")
+    notice_text = format_bio_delete_notice(custom_msg, user)
+    try:
+        notice_msg = await bot.send_message(chat_id, notice_text, parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, notice_msg.message_id, delay_seconds=15))
+    except Exception as e:
+        logger.warning(f"Could not deliver bio violation notice in {chat_id}: {e}")
+
+    # If action is 'delete', we are done (message deleted + notice sent)
     if action == "delete":
         return
 
-    # Step 2: Execute specific configured action if not silent delete
+    # Step 3: Execute specific configured action if not default delete
     try:
         if action == "warn":
-            warn_text = (
-                f"⚠️ <b>Warning {mention}!</b>\n\n"
-                f"Your message was removed because your profile contains a restricted link or connected channel.\n"
-                f"<i>Please remove any links, @handles, or connected channels to chat here.</i>"
-            )
-            warn_msg = await bot.send_message(chat_id, warn_text, parse_mode="HTML")
-            asyncio.create_task(auto_delete_message(chat_id, warn_msg.message_id, 12))
+            pass
 
         elif action == "mute":
             permissions = types.ChatPermissions(
@@ -506,10 +609,12 @@ async def cmd_start(message: types.Message):
         welcome_text = (
             "👋 <b>Welcome to BioLink Channel Restrictor!</b>\n\n"
             "This bot automatically keeps group chats clean by scanning members' profiles "
-            "for promotional URLs, link aggregators, channel @handles, and <b>connected channels</b>.\n\n"
+            "for promotional URLs, link aggregators, channel @handles, and <b>connected channels</b>, "
+            "as well as blocking unauthorized in-chat links, forwards, and bot mentions.\n\n"
             "<b>Default Protection:</b>\n"
             "• Active by default in every group (no setup needed).\n"
-            "• Automatically deletes messages from users AND admins with bio links or connected channels.\n\n"
+            "• Automatically deletes messages from users AND admins with bio links or connected channels.\n"
+            "• Automatically deletes all unauthorized in-chat links, forwards, and bot mentions.\n\n"
             "<b>Setup Instructions:</b>\n"
             "1️⃣ Add this bot to your Telegram Group.\n"
             "2️⃣ Promote it to <b>Administrator</b> with permissions to <i>Delete Messages</i> "
@@ -518,9 +623,14 @@ async def cmd_start(message: types.Message):
             "<b>Admin Commands:</b>\n"
             "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code> - Configure punishment (Default: delete)\n"
             "• <code>/toggleadmin</code> - Toggle whether admins are scanned (Default: False / Admins are scanned)\n"
-            "• <code>/free</code> (Owner/Anon Admin only) - Exempt trusted user or admin\n"
-            "• <code>/unfree</code> (Owner/Anon Admin only) - Remove exemption\n"
-            "• <code>/status</code> - View current configuration"
+            "• <code>/free &lt;reply or @user&gt;</code> - Exempt bio links (Owner/Anon Admin only)\n"
+            "• <code>/free link &lt;reply or @user&gt;</code> - Permit sending links in chat (Owner/Anon Admin only)\n"
+            "• <code>/unfree &lt;reply or @user&gt;</code> - Remove bio exemption (Owner/Anon Admin only)\n"
+            "• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link permission (Owner/Anon Admin only)\n"
+            "• <code>/setmsg &lt;text&gt;</code> - Customize bio deletion response message\n"
+            "• <code>/resetmsg</code> - Reset bio deletion notice to default\n"
+            "• <code>/getmsg</code> - View current bio deletion notice\n"
+            "• <code>/status</code> - View current group configuration"
         )
         await bot.reply_to(message, welcome_text, parse_mode="HTML")
         return
@@ -529,10 +639,13 @@ async def cmd_start(message: types.Message):
     chat_id = chat.id
     user_id = message.from_user.id if message.from_user else 0
 
+    schedule_command_cleanup(message, delay=3)
+
     # Verify admin permissions
     is_admin = await is_user_admin(chat_id, user_id, message)
     if not is_admin:
-        await bot.reply_to(message, "⚠️ <i>Only group administrators can configure this bot.</i>", parse_mode="HTML")
+        err_msg = await bot.reply_to(message, "⚠️ <i>Only group administrators can configure this bot.</i>", parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, err_msg.message_id, 10))
         return
 
     # Initialize / retrieve group configuration (ACTIVE BY DEFAULT)
@@ -546,23 +659,29 @@ async def cmd_start(message: types.Message):
     action = group_config.get("action", "delete")
     ignore_admins = group_config.get("ignore_admins", False)
     free_count = len(group_config.get("free_list", set()))
+    link_count = len(group_config.get("free_links", set()))
 
     activation_text = (
         "🛡️ <b>BioLink Protection is Active!</b>\n\n"
-        "All messages are actively filtered for promotional links, website domains, and connected channels.\n\n"
+        "All messages are actively filtered for promotional links, website domains, connected channels, "
+        "and unauthorized chat links.\n\n"
         "<b>Current Configuration:</b>\n"
         "• <b>Status:</b> Active ✅ (Default)\n"
         f"• <b>Action:</b> <code>{action}</code>\n"
         f"• <b>Filter Admins:</b> <code>{'Disabled (Admins exempt)' if ignore_admins else 'Enabled (Admins are scanned & deleted too)'}</code>\n"
-        f"• <b>Exempt Users (/free):</b> <code>{free_count}</code>\n\n"
+        f"• <b>Bio Exempt Users (/free):</b> <code>{free_count}</code>\n"
+        f"• <b>Link Allowed Users (/free link):</b> <code>{link_count}</code>\n\n"
         "<b>Commands:</b>\n"
-        "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code> - Change action\n"
-        "• <code>/toggleadmin</code> - Toggle admin filtering\n"
-        "• <code>/free &lt;reply or @user&gt;</code> - Exempt user (Owner/Anon Admin only)\n"
-        "• <code>/unfree &lt;reply or @user&gt;</code> - Remove exemption (Owner/Anon Admin only)\n"
-        "• <code>/status</code> - View group configuration"
+        "• <code>/free &lt;reply or @user&gt;</code> - Exempt bio links (Owner/Anon Admin only)\n"
+        "• <code>/free link &lt;reply or @user&gt;</code> - Permit sending links (Owner/Anon Admin only)\n"
+        "• <code>/unfree &lt;reply or @user&gt;</code> - Revoke bio exemption\n"
+        "• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link permission\n"
+        "• <code>/setmsg &lt;text&gt;</code> - Customize bio delete message\n"
+        "• <code>/resetmsg</code> - Reset bio message to default\n"
+        "• <code>/status</code> - View full configuration"
     )
-    await bot.reply_to(message, activation_text, parse_mode="HTML")
+    reply_msg = await bot.reply_to(message, activation_text, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply_msg.message_id, 25))
     logger.info(f"Group {chat_id} ({chat.title}) verified by user {user_id}")
 
 
@@ -576,9 +695,12 @@ async def cmd_setaction(message: types.Message):
         await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
         return
 
+    schedule_command_cleanup(message, delay=3)
+
     user_id = message.from_user.id if message.from_user else 0
     if not await is_user_admin(chat_id, user_id, message):
-        await bot.reply_to(message, "⚠️ <i>Only administrators can configure this bot.</i>", parse_mode="HTML")
+        err = await bot.reply_to(message, "⚠️ <i>Only administrators can configure this bot.</i>", parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, err.message_id, 10))
         return
 
     group_config = get_group_config(chat_id)
@@ -591,12 +713,13 @@ async def cmd_setaction(message: types.Message):
             f"ℹ️ <b>Usage:</b> <code>/setaction &lt;delete|warn|mute|ban&gt;</code>\n\n"
             f"<b>Current Action:</b> <code>{current_action}</code>\n\n"
             f"<b>Options:</b>\n"
-            f"• <code>delete</code> - Silently deletes the violating message (Default)\n"
-            f"• <code>warn</code> - Deletes message and sends a temporary warning in chat\n"
-            f"• <code>mute</code> - Deletes message and restricts the user from sending messages\n"
-            f"• <code>ban</code> - Deletes message and permanently bans the user"
+            f"• <code>delete</code> - Deletes violating message & sends notice (Default)\n"
+            f"• <code>warn</code> - Deletes message and warns user in chat\n"
+            f"• <code>mute</code> - Deletes message and mutes user\n"
+            f"• <code>ban</code> - Deletes message and bans user"
         )
-        await bot.reply_to(message, help_text, parse_mode="HTML")
+        reply = await bot.reply_to(message, help_text, parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
         return
 
     new_action = parts[1].lower()
@@ -611,10 +734,10 @@ async def cmd_setaction(message: types.Message):
         ))
 
     action_descriptions = {
-        "delete": "Delete violating messages silently",
-        "warn": "Delete violating messages and warn the user in chat",
-        "mute": "Delete violating messages and mute the user",
-        "ban": "Delete violating messages and ban the user from group"
+        "delete": "Delete violating messages and notify user to contact @i_am_turtle",
+        "warn": "Delete violating messages and warn user in chat",
+        "mute": "Delete violating messages and mute user",
+        "ban": "Delete violating messages and ban user from group"
     }
 
     resp = (
@@ -622,7 +745,8 @@ async def cmd_setaction(message: types.Message):
         f"<b>New Action:</b> <code>{new_action}</code>\n"
         f"<i>{action_descriptions[new_action]}</i>"
     )
-    await bot.reply_to(message, resp, parse_mode="HTML")
+    reply = await bot.reply_to(message, resp, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
     logger.info(f"Group {chat_id} action updated to '{new_action}' by user {user_id}")
 
 
@@ -637,9 +761,12 @@ async def cmd_toggleadmin(message: types.Message):
         await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
         return
 
+    schedule_command_cleanup(message, delay=3)
+
     user_id = message.from_user.id if message.from_user else 0
     if not await is_user_admin(chat_id, user_id, message):
-        await bot.reply_to(message, "⚠️ <i>Only administrators can configure this bot.</i>", parse_mode="HTML")
+        err = await bot.reply_to(message, "⚠️ <i>Only administrators can configure this bot.</i>", parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, err.message_id, 10))
         return
 
     group_config = get_group_config(chat_id)
@@ -669,125 +796,162 @@ async def cmd_toggleadmin(message: types.Message):
             "Messages from group administrators with links or connected channels in their profile will also be <b>deleted</b>."
         )
 
-    await bot.reply_to(message, status_msg, parse_mode="HTML")
+    reply = await bot.reply_to(message, status_msg, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
     logger.info(f"Group {chat_id} ignore_admins set to {new_state} by user {user_id}")
 
 
 @bot.message_handler(commands=["free"])
 async def cmd_free(message: types.Message):
     """
-    /free: Exempts a user or admin permanently from bio link checks.
+    /free: Exempts a user or admin from bio link checks.
+    /free link: Grants permission to send links/forwards/mentions in chat.
     RESTRICTED TO: Group Owner (Creator) and Anonymous Admin ONLY.
-    Usage:
-    - Reply to a user's message with '/free'
-    - Send '/free @username'
-    - Send '/free <user_id>'
     """
     chat_id = message.chat.id
     if message.chat.type in ("private", "channel"):
         await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
         return
 
+    schedule_command_cleanup(message, delay=3)
     admin_user_id = message.from_user.id if message.from_user else 0
 
     # Verification: Group Owner or Anonymous Admin ONLY
     if not await is_owner_or_anonymous_admin(chat_id, admin_user_id, message):
-        await bot.reply_to(
+        err = await bot.reply_to(
             message,
-            "⚠️ <i>Permission Denied: Only the <b>Group Owner</b> (Creator) or <b>Anonymous Admin</b> can exempt users.</i>",
+            "⚠️ <i>Permission Denied: Only the <b>Group Owner</b> (Creator) or <b>Anonymous Admin</b> can manage exemptions.</i>",
             parse_mode="HTML"
         )
+        asyncio.create_task(auto_delete_message(chat_id, err.message_id, 10))
         return
 
     group_config = get_group_config(chat_id)
+    raw_text = message.text.strip()
+    parts = raw_text.split()
+    is_link_mode = False
+    arg_index = 1
+
+    if len(parts) >= 2 and parts[1].lower() == "link":
+        is_link_mode = True
+        arg_index = 2
+
     target_user_id: Optional[int] = None
     target_display: str = ""
+    clean_uname: str = ""
 
-    # Method 1: Reply to target user's message
+    # Target Method 1: Reply to target user's message
     if message.reply_to_message and message.reply_to_message.from_user:
         target = message.reply_to_message.from_user
         target_user_id = target.id
         target_display = get_user_mention(target)
+        clean_uname = target.username.lower() if target.username else ""
 
-    # Method 2: Argument specified (e.g., /free @username or /free 123456789)
-    else:
-        parts = message.text.strip().split()
-        if len(parts) >= 2:
-            raw_arg = parts[1].strip()
+    # Target Method 2: Argument specified (e.g., /free @username or /free link @username)
+    elif len(parts) > arg_index:
+        raw_arg = parts[arg_index].strip()
 
-            # Sub-case 2a: Numeric User ID
-            if raw_arg.isdigit():
-                target_user_id = int(raw_arg)
-                target_display = f"User <code>{target_user_id}</code>"
+        # Numeric User ID
+        if raw_arg.isdigit():
+            target_user_id = int(raw_arg)
+            target_display = f"User <code>{target_user_id}</code>"
 
-            # Sub-case 2b: Text mention entity in message
-            elif message.entities:
-                for entity in message.entities:
-                    if entity.type == "text_mention" and entity.user:
-                        target_user_id = entity.user.id
-                        target_display = get_user_mention(entity.user)
-                        break
+        # Text mention entity
+        elif message.entities:
+            for entity in message.entities:
+                if entity.type == "text_mention" and entity.user:
+                    target_user_id = entity.user.id
+                    target_display = get_user_mention(entity.user)
+                    clean_uname = entity.user.username.lower() if entity.user.username else ""
+                    break
 
-            # Sub-case 2c: @username resolution
-            if not target_user_id:
-                clean_uname = raw_arg.lstrip("@").lower()
-                # Check in-memory mapping first
-                if clean_uname in username_to_id:
-                    target_user_id = username_to_id[clean_uname]
+        # @username resolution
+        if not target_user_id:
+            clean_uname = raw_arg.lstrip("@").lower()
+            if clean_uname in username_to_id:
+                target_user_id = username_to_id[clean_uname]
+                target_display = f"@{clean_uname} (ID: <code>{target_user_id}</code>)"
+            else:
+                try:
+                    resolved_chat = await bot.get_chat(f"@{clean_uname}")
+                    target_user_id = resolved_chat.id
                     target_display = f"@{clean_uname} (ID: <code>{target_user_id}</code>)"
-                else:
-                    # Attempt Telegram API resolution
-                    try:
-                        resolved_chat = await bot.get_chat(f"@{clean_uname}")
-                        target_user_id = resolved_chat.id
-                        target_display = f"@{clean_uname} (ID: <code>{target_user_id}</code>)"
-                        username_to_id[clean_uname] = target_user_id
-                    except Exception:
-                        pass
+                    username_to_id[clean_uname] = target_user_id
+                except Exception:
+                    pass
 
-    # If target could not be resolved
+    # Target resolution failed -> Show informative usage help
     if not target_user_id:
         usage_msg = (
-            "ℹ️ <b>How to Exempt a User or Admin:</b>\n\n"
-            "1️⃣ <b>Reply to their message</b> with <code>/free</code>\n"
-            "2️⃣ Or send: <code>/free @username</code>\n"
-            "3️⃣ Or send: <code>/free &lt;user_id&gt;</code>\n\n"
+            "ℹ️ <b>How to Use /free:</b>\n\n"
+            "• <b>Bio Exemption (Exempts bio link & connected channel check):</b>\n"
+            "  ↳ Reply to their message with <code>/free</code>\n"
+            "  ↳ Or send: <code>/free @username</code>\n"
+            "  ↳ Or send: <code>/free &lt;user_id&gt;</code>\n\n"
+            "• <b>Link Permission (Allows sending links & forwards in chat):</b>\n"
+            "  ↳ Reply to their message with <code>/free link</code>\n"
+            "  ↳ Or send: <code>/free link @username</code>\n"
+            "  ↳ Or send: <code>/free link &lt;user_id&gt;</code>\n\n"
             "<i>(Only the Group Owner and Anonymous Admin can execute this)</i>"
         )
-        await bot.reply_to(message, usage_msg, parse_mode="HTML")
+        reply = await bot.reply_to(message, usage_msg, parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 25))
         return
 
-    # Add to free_list
+    # Case A: /free link (Grant link sending permission)
+    if is_link_mode:
+        if "free_links" not in group_config:
+            group_config["free_links"] = set()
+        group_config["free_links"].add(target_user_id)
+        save_settings()
+        if db_manager.is_connected:
+            asyncio.create_task(db_manager.add_exempt_link_user(
+                chat_id=chat_id,
+                user_id=target_user_id,
+                username=clean_uname,
+                freed_by=admin_user_id
+            ))
+        success_msg = (
+            f"🔗 <b>Link Permission Granted!</b>\n\n"
+            f"{target_display} is now authorized to send links, forwards, mentions, and channels in this group."
+        )
+        reply = await bot.reply_to(message, success_msg, parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
+        logger.info(f"User/Admin {target_user_id} added to free_links in chat {chat_id} by owner/anon {admin_user_id}")
+        return
+
+    # Case B: Normal /free (Grant bio link exemption)
     if "free_list" not in group_config:
         group_config["free_list"] = set()
-
     group_config["free_list"].add(target_user_id)
     save_settings()
     if db_manager.is_connected:
-        target_uname = clean_uname if 'clean_uname' in locals() else ""
         asyncio.create_task(db_manager.add_exempt_user(
             chat_id=chat_id,
             user_id=target_user_id,
-            username=target_uname,
+            username=clean_uname,
             freed_by=admin_user_id
         ))
 
-    # Remove any cached bio flag to ensure instant clearance
+    # Clear cached bio flag for instant clearance
     bio_cache.pop(target_user_id, None)
 
     success_msg = (
-        f"✅ <b>Exemption Granted!</b>\n\n"
-        f"{target_display} has been added to this group's exemption list.\n"
-        f"<i>All bio and connected channel checks will be bypassed permanently for this person.</i>"
+        f"✅ <b>Bio Exemption Granted!</b>\n\n"
+        f"{target_display} has been added to this group's bio exemption list.\n"
+        f"<i>All bio and connected channel checks will be bypassed for this person.</i>\n\n"
+        f"💡 <i>Note: To allow them to send in-chat links & forwards as well, use <code>/free link</code></i>"
     )
-    await bot.reply_to(message, success_msg, parse_mode="HTML")
+    reply = await bot.reply_to(message, success_msg, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
     logger.info(f"User/Admin {target_user_id} added to free_list in chat {chat_id} by owner/anon {admin_user_id}")
 
 
 @bot.message_handler(commands=["unfree"])
 async def cmd_unfree(message: types.Message):
     """
-    /unfree: Removes a user or admin from the chat's exemption list.
+    /unfree: Removes bio exemption from a user or admin.
+    /unfree link: Revokes link sending permission from a user or admin.
     RESTRICTED TO: Group Owner (Creator) and Anonymous Admin ONLY.
     """
     chat_id = message.chat.id
@@ -795,36 +959,93 @@ async def cmd_unfree(message: types.Message):
         await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
         return
 
+    schedule_command_cleanup(message, delay=3)
     admin_user_id = message.from_user.id if message.from_user else 0
 
     # Verification: Group Owner or Anonymous Admin ONLY
     if not await is_owner_or_anonymous_admin(chat_id, admin_user_id, message):
-        await bot.reply_to(
+        err = await bot.reply_to(
             message,
             "⚠️ <i>Permission Denied: Only the <b>Group Owner</b> (Creator) or <b>Anonymous Admin</b> can use this command.</i>",
             parse_mode="HTML"
         )
+        asyncio.create_task(auto_delete_message(chat_id, err.message_id, 10))
         return
 
     group_config = get_group_config(chat_id)
+    raw_text = message.text.strip()
+    parts = raw_text.split()
+    is_link_mode = False
+    arg_index = 1
+
+    if len(parts) >= 2 and parts[1].lower() == "link":
+        is_link_mode = True
+        arg_index = 2
+
     target_user_id: Optional[int] = None
+    target_display: str = ""
 
+    # Target Method 1: Reply to target user's message
     if message.reply_to_message and message.reply_to_message.from_user:
-        target_user_id = message.reply_to_message.from_user.id
-    else:
-        parts = message.text.strip().split()
-        if len(parts) >= 2:
-            arg = parts[1].strip()
-            if arg.isdigit():
-                target_user_id = int(arg)
-            else:
-                clean_uname = arg.lstrip("@").lower()
-                target_user_id = username_to_id.get(clean_uname)
+        target = message.reply_to_message.from_user
+        target_user_id = target.id
+        target_display = get_user_mention(target)
 
+    # Target Method 2: Argument specified
+    elif len(parts) > arg_index:
+        raw_arg = parts[arg_index].strip()
+        if raw_arg.isdigit():
+            target_user_id = int(raw_arg)
+            target_display = f"User <code>{target_user_id}</code>"
+        elif message.entities:
+            for entity in message.entities:
+                if entity.type == "text_mention" and entity.user:
+                    target_user_id = entity.user.id
+                    target_display = get_user_mention(entity.user)
+                    break
+        if not target_user_id:
+            clean_uname = raw_arg.lstrip("@").lower()
+            target_user_id = username_to_id.get(clean_uname)
+            if target_user_id:
+                target_display = f"@{clean_uname} (ID: <code>{target_user_id}</code>)"
+
+    # Target resolution failed
     if not target_user_id:
-        await bot.reply_to(message, "ℹ️ <b>Usage:</b> Reply to user with <code>/unfree</code> or send <code>/unfree &lt;id|@username&gt;</code>", parse_mode="HTML")
+        usage_msg = (
+            "ℹ️ <b>How to Use /unfree:</b>\n\n"
+            "• <b>Remove Bio Exemption:</b>\n"
+            "  ↳ Reply with <code>/unfree</code> or send <code>/unfree @username</code>\n\n"
+            "• <b>Revoke Link Permission:</b>\n"
+            "  ↳ Reply with <code>/unfree link</code> or send <code>/unfree link @username</code>\n\n"
+            "<i>(Owner and Anonymous Admin only)</i>"
+        )
+        reply = await bot.reply_to(message, usage_msg, parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 25))
         return
 
+    # Case A: /unfree link (Revoke link permission)
+    if is_link_mode:
+        free_links = group_config.get("free_links", set())
+        if target_user_id in free_links:
+            free_links.discard(target_user_id)
+            save_settings()
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.remove_exempt_link_user(chat_id, target_user_id))
+            reply = await bot.reply_to(
+                message,
+                f"🚫 <b>Link Permission Revoked!</b>\n\n{target_display} can no longer send links, forwards, or bot mentions in this group.",
+                parse_mode="HTML"
+            )
+        else:
+            reply = await bot.reply_to(
+                message,
+                f"ℹ️ {target_display} did not have link sending permissions.",
+                parse_mode="HTML"
+            )
+        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
+        return
+
+    # Case B: Normal /unfree (Revoke bio exemption)
     free_list = group_config.get("free_list", set())
     if target_user_id in free_list:
         free_list.discard(target_user_id)
@@ -832,9 +1053,140 @@ async def cmd_unfree(message: types.Message):
         if db_manager.is_connected:
             asyncio.create_task(db_manager.remove_exempt_user(chat_id, target_user_id))
         bio_cache.pop(target_user_id, None)
-        await bot.reply_to(message, f"✅ User <code>{target_user_id}</code> removed from exemption list.", parse_mode="HTML")
+        reply = await bot.reply_to(
+            message,
+            f"❌ <b>Bio Exemption Revoked!</b>\n\n{target_display} has been removed from this group's bio exemption list.",
+            parse_mode="HTML"
+        )
     else:
-        await bot.reply_to(message, f"ℹ️ User <code>{target_user_id}</code> was not on the exemption list.", parse_mode="HTML")
+        reply = await bot.reply_to(
+            message,
+            f"ℹ️ {target_display} was not on the bio exemption list.",
+            parse_mode="HTML"
+        )
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
+
+
+@bot.message_handler(commands=["setmsg", "setbiomsg"])
+async def cmd_setmsg(message: types.Message):
+    """
+    /setmsg <text>: Customizes the warning notice sent when a message is deleted
+    due to bio link or connected channel.
+    """
+    chat_id = message.chat.id
+    if message.chat.type in ("private", "channel"):
+        await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
+        return
+
+    schedule_command_cleanup(message, delay=3)
+    user_id = message.from_user.id if message.from_user else 0
+
+    if not await is_user_admin(chat_id, user_id, message):
+        err = await bot.reply_to(message, "⚠️ <i>Only administrators can configure this bot.</i>", parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, err.message_id, 10))
+        return
+
+    group_config = get_group_config(chat_id)
+    raw_text = message.text.strip()
+    parts = raw_text.split(maxsplit=1)
+
+    if len(parts) < 2 or not parts[1].strip():
+        current_msg = group_config.get("custom_bio_msg") or DEFAULT_BIO_DELETE_MSG
+        usage_text = (
+            "ℹ️ <b>How to Set Custom Bio Deletion Notice:</b>\n\n"
+            "Usage: <code>/setmsg &lt;your message&gt;</code>\n\n"
+            "<b>Placeholders available:</b>\n"
+            "• <code>{mention}</code> - Clickable mention of user\n"
+            "• <code>{name}</code> - User's first name\n"
+            "• <code>{id}</code> - User's Telegram ID\n\n"
+            "<b>Current Message:</b>\n"
+            f"{html.escape(current_msg)}\n\n"
+            "<i>(Use <code>/resetmsg</code> to restore default message)</i>"
+        )
+        reply = await bot.reply_to(message, usage_text, parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 25))
+        return
+
+    custom_text = parts[1].strip()
+    group_config["custom_bio_msg"] = custom_text
+    save_settings()
+    if db_manager.is_connected:
+        asyncio.create_task(db_manager.set_custom_bio_msg(chat_id, custom_text))
+
+    preview = format_bio_delete_notice(custom_text, message.from_user)
+    success_text = (
+        "✅ <b>Custom Bio Deletion Notice Saved!</b>\n\n"
+        "<b>Live Preview:</b>\n"
+        f"{preview}"
+    )
+    reply = await bot.reply_to(message, success_text, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
+    logger.info(f"Group {chat_id} custom_bio_msg updated by user {user_id}")
+
+
+@bot.message_handler(commands=["resetmsg"])
+async def cmd_resetmsg(message: types.Message):
+    """
+    /resetmsg: Resets the bio deletion notice to the default message directing to @i_am_turtle.
+    """
+    chat_id = message.chat.id
+    if message.chat.type in ("private", "channel"):
+        await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
+        return
+
+    schedule_command_cleanup(message, delay=3)
+    user_id = message.from_user.id if message.from_user else 0
+
+    if not await is_user_admin(chat_id, user_id, message):
+        err = await bot.reply_to(message, "⚠️ <i>Only administrators can configure this bot.</i>", parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, err.message_id, 10))
+        return
+
+    group_config = get_group_config(chat_id)
+    group_config["custom_bio_msg"] = None
+    save_settings()
+    if db_manager.is_connected:
+        asyncio.create_task(db_manager.set_custom_bio_msg(chat_id, None))
+
+    reset_text = (
+        "🔄 <b>Bio Deletion Notice Reset to Default:</b>\n\n"
+        f"{DEFAULT_BIO_DELETE_MSG}"
+    )
+    reply = await bot.reply_to(message, reset_text, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
+
+
+@bot.message_handler(commands=["getmsg", "showmsg"])
+async def cmd_getmsg(message: types.Message):
+    """
+    /getmsg: Displays the current bio deletion notice message for the group.
+    """
+    chat_id = message.chat.id
+    if message.chat.type in ("private", "channel"):
+        await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
+        return
+
+    schedule_command_cleanup(message, delay=3)
+    user_id = message.from_user.id if message.from_user else 0
+
+    if not await is_user_admin(chat_id, user_id, message):
+        err = await bot.reply_to(message, "⚠️ <i>Only administrators can view this setting.</i>", parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, err.message_id, 10))
+        return
+
+    group_config = get_group_config(chat_id)
+    custom_msg = group_config.get("custom_bio_msg")
+    status_label = "Custom" if custom_msg else "Default"
+    current_text = custom_msg or DEFAULT_BIO_DELETE_MSG
+
+    resp = (
+        f"📋 <b>Current Bio Deletion Notice ({status_label}):</b>\n\n"
+        f"{html.escape(current_text)}\n\n"
+        f"<b>Preview with Mention:</b>\n"
+        f"{format_bio_delete_notice(custom_msg, message.from_user)}"
+    )
+    reply = await bot.reply_to(message, resp, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 25))
 
 
 @bot.message_handler(commands=["status", "settings"])
@@ -847,28 +1199,40 @@ async def cmd_status(message: types.Message):
         await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
         return
 
+    schedule_command_cleanup(message, delay=3)
     user_id = message.from_user.id if message.from_user else 0
+
     if not await is_user_admin(chat_id, user_id, message):
-        await bot.reply_to(message, "⚠️ <i>Only administrators can view bot status.</i>", parse_mode="HTML")
+        err = await bot.reply_to(message, "⚠️ <i>Only administrators can view bot status.</i>", parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, err.message_id, 10))
         return
 
     config = get_group_config(chat_id)
     action = config.get("action", "delete")
     ignore_admins = config.get("ignore_admins", False)
-    exempt_count = len(config.get("free_list", set()))
+    bio_exempt_count = len(config.get("free_list", set()))
+    link_exempt_count = len(config.get("free_links", set()))
+    has_custom_msg = "Customized ✅" if config.get("custom_bio_msg") else "Default (@i_am_turtle) ℹ️"
 
     status_text = (
         "⚙️ <b>BioLink Protection: ACTIVE ✅ (Default)</b>\n\n"
-        f"• <b>Configured Action:</b> <code>{action}</code> (Deletes violating messages)\n"
+        f"• <b>Configured Action:</b> <code>{action}</code>\n"
         f"• <b>Filter Admins:</b> <code>{'Disabled (Admins exempt)' if ignore_admins else 'Enabled (Admins are scanned & deleted too)'}</code>\n"
-        f"• <b>Exempt Users (/free):</b> <code>{exempt_count}</code>\n\n"
+        f"• <b>Bio Exempt Users (/free):</b> <code>{bio_exempt_count}</code>\n"
+        f"• <b>Link Allowed Users (/free link):</b> <code>{link_exempt_count}</code>\n"
+        f"• <b>Bio Deletion Notice:</b> <code>{has_custom_msg}</code>\n\n"
         "<b>Admin Controls:</b>\n"
+        "• <code>/free &lt;user&gt;</code> - Exempt bio links (Owner/Anon Admin only)\n"
+        "• <code>/free link &lt;user&gt;</code> - Permit sending links (Owner/Anon Admin only)\n"
+        "• <code>/unfree &lt;user&gt;</code> - Revoke bio exemption\n"
+        "• <code>/unfree link &lt;user&gt;</code> - Revoke link permission\n"
+        "• <code>/setmsg &lt;text&gt;</code> - Customize bio notice\n"
+        "• <code>/resetmsg</code> - Reset bio notice\n"
         "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code>\n"
-        "• <code>/toggleadmin</code>\n"
-        "• <code>/free &lt;reply or @user&gt;</code> (Owner/Anon Admin only)\n"
-        "• <code>/unfree &lt;reply or @user&gt;</code> (Owner/Anon Admin only)"
+        "• <code>/toggleadmin</code>"
     )
-    await bot.reply_to(message, status_text, parse_mode="HTML")
+    reply = await bot.reply_to(message, status_text, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 25))
 
 
 @bot.message_handler(commands=["help"])
@@ -876,21 +1240,33 @@ async def cmd_help(message: types.Message):
     """
     /help: Displays command documentation.
     """
+    chat_id = message.chat.id
+    schedule_command_cleanup(message, delay=3)
+
     help_text = (
-        "📖 <b>BioLink Channel Restrictor - Help Guide</b>\n\n"
+        "📖 <b>BioLink Channel Restrictor - Complete Command Guide</b>\n\n"
         "<b>Default Behavior:</b>\n"
-        "• Active automatically in all groups without needing /start.\n"
-        "• Automatically deletes messages from members AND admins who have promotional links, website domains, @channel handles, or connected channels in their profile.\n\n"
-        "<b>Administrator Commands:</b>\n"
-        "• <code>/start</code> - Check status & confirm active protection\n"
+        "• Active automatically across all groups without needing /start.\n"
+        "• Deletes messages from users & admins with bio links or connected channels.\n"
+        "• Deletes all unauthorized chat links, forwards, mentions, and bots.\n"
+        "• Admin commands are automatically deleted within 3 seconds.\n\n"
+        "<b>Exemption Commands (Owner & Anonymous Admin Only):</b>\n"
+        "• <code>/free &lt;reply or @user&gt;</code> - Exempt from bio/channel checks\n"
+        "• <code>/free link &lt;reply or @user&gt;</code> - Authorize sending links & forwards in chat\n"
+        "• <code>/unfree &lt;reply or @user&gt;</code> - Revoke bio exemption\n"
+        "• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link sending permission\n\n"
+        "<b>Configuration Commands (All Admins):</b>\n"
+        "• <code>/setmsg &lt;text&gt;</code> - Customize bio delete response message\n"
+        "• <code>/resetmsg</code> - Reset bio delete message to default\n"
+        "• <code>/getmsg</code> - View active bio delete message\n"
         "• <code>/setaction &lt;delete|warn|mute|ban&gt;</code> - Configure punishment (Default: delete)\n"
-        "• <code>/toggleadmin</code> - Toggle whether admins are scanned (Default: False / admins are scanned)\n"
-        "• <code>/free</code> - Exempt a user/admin (Owner or Anonymous Admin only)\n"
-        "• <code>/unfree</code> - Remove exemption (Owner or Anonymous Admin only)\n"
-        "• <code>/status</code> - View current configuration & stats\n"
-        "• <code>/help</code> - Show this documentation"
+        "• <code>/toggleadmin</code> - Toggle whether admins are scanned\n"
+        "• <code>/status</code> - View group configuration\n"
+        "• <code>/help</code> - Show this guide"
     )
-    await bot.reply_to(message, help_text, parse_mode="HTML")
+    reply = await bot.reply_to(message, help_text, parse_mode="HTML")
+    if message.chat.type in ("group", "supergroup"):
+        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 30))
 
 
 # ------------------------------------------------------------------------------
@@ -901,12 +1277,18 @@ async def cmd_help(message: types.Message):
 @bot.edited_message_handler(func=lambda msg: True, content_types=ALL_CONTENT_TYPES)
 async def process_chat_message(message: types.Message):
     """
-    Core Antigravity Filter Engine:
-    Intercepts every incoming and edited message in active groups.
-    Fast Check 1: Skip Admins/Anonymous Admins if ignore_admins is True.
-    Fast Check 2: Skip users on the chat's free_list.
-    Bio Scan: Check bio for URL links or channel handles.
-    Action Trigger: Execute configured action (delete, warn, mute, ban).
+    Core Filter Engine:
+    1. Fast Filter: Groups & supergroups only; ignore command messages.
+    2. Username Tracking: Dynamically records usernames to user IDs for resolution.
+    3. Anonymous Admin Bypass: Allowed.
+    4. Check 1 - In-Chat Link & Forward Filter:
+       - Detects forwards, URLs, inline links, mentions, table links.
+       - Allowed ONLY IF sender is in free_links or is Owner/Anon Admin.
+       - On violation: Silently deletes message immediately without sending mention message!
+    5. Check 2 - Profile Bio & Connected Channel Filter:
+       - Skipped if user is in free_list or Owner/Anon Admin or ignore_admins is True for admins.
+       - On violation: Deletes message, sends mentioned response notice with contact @i_am_turtle,
+         and executes configured action.
     """
     # Filter 0: Only operate on groups & supergroups
     if message.chat.type not in ("group", "supergroup"):
@@ -933,7 +1315,6 @@ async def process_chat_message(message: types.Message):
         (message.from_user and message.from_user.id == ANONYMOUS_ADMIN_USER_ID)
     )
 
-    # Anonymous admin messages sent as the group itself have no personal profile/bio
     if is_anon_admin:
         return
 
@@ -943,15 +1324,60 @@ async def process_chat_message(message: types.Message):
 
     user_id = message.from_user.id
 
-    # Fast Check 1: Exemption List (/free) - Bypasses all checks for exempted users/admins
+    # --------------------------------------------------------------------------
+    # Check 1: In-Chat Link & Forward Restriction
+    # --------------------------------------------------------------------------
+    has_chat_link, link_reason = detect_chat_link(message)
+    if has_chat_link:
+        free_links: Set[int] = group_config.get("free_links", set())
+        is_link_allowed = (user_id in free_links)
+
+        if not is_link_allowed:
+            # Check if user is Group Owner or Anonymous Admin
+            if await is_owner_or_anonymous_admin(chat_id, user_id, message):
+                is_link_allowed = True
+            elif group_config.get("ignore_admins", False):
+                if await is_user_admin(chat_id, user_id, message):
+                    is_link_allowed = True
+
+        if not is_link_allowed:
+            # User requirement: Silently delete message; DO NOT send response mention notice
+            try:
+                await bot.delete_message(chat_id, message.message_id)
+            except TELEGRAM_EXCEPTIONS as e:
+                logger.warning(f"Could not delete restricted link message {message.message_id} in {chat_id}: {e}")
+
+            if db_manager.is_connected:
+                msg_content = message.text or message.caption or ""
+                asyncio.create_task(db_manager.log_moderation_event(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    username=message.from_user.username or "",
+                    first_name=message.from_user.first_name or "",
+                    is_admin=False,
+                    violation_type="chat_link",
+                    violation_detail=link_reason,
+                    action_taken="delete",
+                    message_text=msg_content
+                ))
+            return
+
+    # --------------------------------------------------------------------------
+    # Check 2: Profile Bio & Connected Channel Restriction
+    # --------------------------------------------------------------------------
+    # Fast Check 2a: Bio Exemption List (/free)
     free_list: Set[int] = group_config.get("free_list", set())
     if user_id in free_list:
         return
 
-    # Fast Check 2: Skip admins ONLY IF ignore_admins is True (Default: False / Admins are scanned)
+    # Fast Check 2b: Skip admins ONLY IF ignore_admins is True (Default: False / Admins are scanned)
     if group_config.get("ignore_admins", False):
         if await is_user_admin(chat_id, user_id, message):
             return
+
+    # Fast Check 2c: Group Owner is always exempt from bio scan
+    if await is_owner_or_anonymous_admin(chat_id, user_id, message):
+        return
 
     # Bio & Connected Channel Scan
     has_violation, reason = await scan_user_bio(user_id)
@@ -960,7 +1386,6 @@ async def process_chat_message(message: types.Message):
 
     # Action Trigger: User or Admin has a link, handle, or connected channel!
     configured_action = group_config.get("action", "delete")
-    # Offload action execution asynchronously so the event loop returns in microseconds
     asyncio.create_task(execute_action(message, configured_action, reason))
 
 
@@ -1241,13 +1666,16 @@ async def register_bot_commands():
     Scoped specifically so admin commands only appear for chat administrators.
     """
     admin_commands = [
-        types.BotCommand("start", "Activate bio link protection in group"),
+        types.BotCommand("start", "Activate & verify bot protection"),
         types.BotCommand("setaction", "Set punishment: delete, warn, mute, ban"),
-        types.BotCommand("toggleadmin", "Toggle skipping admins (default: True)"),
-        types.BotCommand("free", "Exempt a user permanently (reply or @user)"),
-        types.BotCommand("unfree", "Remove user from exemption list"),
+        types.BotCommand("toggleadmin", "Toggle admin scanning (default: scanned)"),
+        types.BotCommand("free", "Exempt bio or links (/free or /free link)"),
+        types.BotCommand("unfree", "Revoke exemption (/unfree or /unfree link)"),
+        types.BotCommand("setmsg", "Customize bio delete response message"),
+        types.BotCommand("resetmsg", "Reset bio delete message to default"),
+        types.BotCommand("getmsg", "View current bio delete message"),
         types.BotCommand("status", "Show current group protection status"),
-        types.BotCommand("help", "Show administrator commands & usage guide"),
+        types.BotCommand("help", "Show complete command guide"),
     ]
 
     private_commands = [

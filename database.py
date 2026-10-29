@@ -94,6 +94,7 @@ class DatabaseManager:
             # 1. groups collection indexes
             groups_col = self.db["groups"]
             await groups_col.create_index([("free_list", ASCENDING)], name="idx_free_list", background=True)
+            await groups_col.create_index([("free_links", ASCENDING)], name="idx_free_links", background=True)
 
             # 2. moderation_logs collection indexes
             logs_col = self.db["moderation_logs"]
@@ -140,6 +141,8 @@ class DatabaseManager:
                     "action": doc.get("action", "delete"),
                     "ignore_admins": doc.get("ignore_admins", False),
                     "free_list": set(doc.get("free_list", [])),
+                    "free_links": set(doc.get("free_links", [])),
+                    "custom_bio_msg": doc.get("custom_bio_msg", None),
                     "title": doc.get("title", "")
                 }
             logger.info(f"Loaded {len(groups_dict)} group(s) from MongoDB.")
@@ -153,7 +156,8 @@ class DatabaseManager:
         title: str = "",
         activated: bool = True,
         action: str = "delete",
-        ignore_admins: bool = False
+        ignore_admins: bool = False,
+        custom_bio_msg: Optional[str] = None
     ):
         """
         Persists or updates group settings in MongoDB atomically.
@@ -171,6 +175,8 @@ class DatabaseManager:
             }
             if title:
                 update_fields["title"] = title
+            if custom_bio_msg is not None:
+                update_fields["custom_bio_msg"] = custom_bio_msg
 
             await self.db["groups"].update_one(
                 {"_id": chat_id},
@@ -178,6 +184,8 @@ class DatabaseManager:
                     "$set": update_fields,
                     "$setOnInsert": {
                         "free_list": [],
+                        "free_links": [],
+                        "custom_bio_msg": None,
                         "exemptions_detail": [],
                         "created_at": now
                     }
@@ -205,6 +213,7 @@ class DatabaseManager:
         detail = {
             "user_id": user_id,
             "username": username or "",
+            "type": "bio",
             "freed_by": freed_by,
             "freed_at": now
         }
@@ -219,6 +228,8 @@ class DatabaseManager:
                         "activated": True,
                         "action": "delete",
                         "ignore_admins": False,
+                        "free_links": [],
+                        "custom_bio_msg": None,
                         "created_at": now
                     }
                 },
@@ -242,7 +253,7 @@ class DatabaseManager:
                 {
                     "$pull": {
                         "free_list": user_id,
-                        "exemptions_detail": {"user_id": user_id}
+                        "exemptions_detail": {"user_id": user_id, "type": "bio"}
                     },
                     "$set": {"updated_at": now}
                 }
@@ -250,6 +261,97 @@ class DatabaseManager:
             logger.info(f"MongoDB: User {user_id} removed from free_list for chat {chat_id}")
         except Exception as e:
             logger.error(f"Failed to remove exempt user {user_id} from chat {chat_id} in MongoDB: {e}")
+
+    async def add_exempt_link_user(
+        self,
+        chat_id: int,
+        user_id: int,
+        username: str = "",
+        freed_by: int = 0
+    ):
+        """
+        Atomically adds a user ID to the group's free_links ($addToSet)
+        granting permission to send in-chat links, forwards, mentions.
+        """
+        if not self.is_connected or self.db is None:
+            return
+
+        now = datetime.utcnow()
+        detail = {
+            "user_id": user_id,
+            "username": username or "",
+            "type": "link",
+            "freed_by": freed_by,
+            "freed_at": now
+        }
+        try:
+            await self.db["groups"].update_one(
+                {"_id": chat_id},
+                {
+                    "$addToSet": {"free_links": user_id},
+                    "$push": {"exemptions_detail": detail},
+                    "$set": {"updated_at": now},
+                    "$setOnInsert": {
+                        "activated": True,
+                        "action": "delete",
+                        "ignore_admins": False,
+                        "free_list": [],
+                        "custom_bio_msg": None,
+                        "created_at": now
+                    }
+                },
+                upsert=True
+            )
+            logger.info(f"MongoDB: User {user_id} added to free_links for chat {chat_id}")
+        except Exception as e:
+            logger.error(f"Failed to add exempt link user {user_id} to chat {chat_id} in MongoDB: {e}")
+
+    async def remove_exempt_link_user(self, chat_id: int, user_id: int):
+        """
+        Atomically removes a user ID from the group's free_links ($pull).
+        """
+        if not self.is_connected or self.db is None:
+            return
+
+        now = datetime.utcnow()
+        try:
+            await self.db["groups"].update_one(
+                {"_id": chat_id},
+                {
+                    "$pull": {
+                        "free_links": user_id,
+                        "exemptions_detail": {"user_id": user_id, "type": "link"}
+                    },
+                    "$set": {"updated_at": now}
+                }
+            )
+            logger.info(f"MongoDB: User {user_id} removed from free_links for chat {chat_id}")
+        except Exception as e:
+            logger.error(f"Failed to remove exempt link user {user_id} from chat {chat_id} in MongoDB: {e}")
+
+    async def set_custom_bio_msg(self, chat_id: int, custom_msg: Optional[str]):
+        """
+        Updates the customizable bio violation response message for a group.
+        Pass None to reset to default.
+        """
+        if not self.is_connected or self.db is None:
+            return
+
+        now = datetime.utcnow()
+        try:
+            await self.db["groups"].update_one(
+                {"_id": chat_id},
+                {
+                    "$set": {
+                        "custom_bio_msg": custom_msg,
+                        "updated_at": now
+                    }
+                },
+                upsert=True
+            )
+            logger.info(f"MongoDB: custom_bio_msg updated for chat {chat_id}")
+        except Exception as e:
+            logger.error(f"Failed to update custom_bio_msg for chat {chat_id} in MongoDB: {e}")
 
     async def log_moderation_event(
         self,
@@ -289,7 +391,15 @@ class DatabaseManager:
             await self.db["moderation_logs"].insert_one(doc)
 
             # 2. Increment global metrics counters atomically
-            inc_field = "total_connected_channels_caught" if violation_type == "connected_channel" else "total_bio_links_caught"
+            if violation_type == "connected_channel":
+                inc_field = "total_connected_channels_caught"
+            elif violation_type == "bio_link":
+                inc_field = "total_bio_links_caught"
+            elif violation_type == "chat_link":
+                inc_field = "total_chat_links_caught"
+            else:
+                inc_field = "total_other_violations_caught"
+
             await self.db["bot_metrics"].update_one(
                 {"_id": "global_metrics"},
                 {
@@ -320,6 +430,7 @@ class DatabaseManager:
                 "violations_handled": doc.get("total_violations_handled", 0),
                 "connected_channels_caught": doc.get("total_connected_channels_caught", 0),
                 "bio_links_caught": doc.get("total_bio_links_caught", 0),
+                "chat_links_caught": doc.get("total_chat_links_caught", 0),
                 "last_heartbeat": str(doc.get("last_heartbeat", ""))
             }
         except Exception:

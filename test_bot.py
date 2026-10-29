@@ -19,8 +19,12 @@ from main import (
     load_settings,
     ADMIN_CACHE_TTL,
     BIO_CACHE_TTL,
-    http_health_handler
+    http_health_handler,
+    detect_chat_link,
+    format_bio_delete_notice,
+    DEFAULT_BIO_DELETE_MSG
 )
+from telebot import types
 
 class TestBioRegex(unittest.TestCase):
     def test_links_detected(self):
@@ -153,6 +157,123 @@ class TestDatabaseManager(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(db_manager.is_connected)
         metrics = await db_manager.get_metrics()
         self.assertFalse(metrics["connected"])
+
+
+class TestChatLinkDetection(unittest.TestCase):
+    def test_benign_message(self):
+        msg = types.Message(
+            message_id=1,
+            from_user=types.User(id=101, is_bot=False, first_name="Alice"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Hello everyone, how are you today?"
+        has_link, reason = detect_chat_link(msg)
+        self.assertFalse(has_link)
+        self.assertEqual(reason, "")
+
+    def test_forwarded_message(self):
+        msg = types.Message.de_json({
+            "message_id": 2,
+            "from": {"id": 102, "is_bot": False, "first_name": "Bob"},
+            "date": int(time.time()),
+            "chat": {"id": -1001, "type": "supergroup"},
+            "text": "Forwarded announcement here",
+            "forward_origin": {
+                "type": "user",
+                "date": int(time.time()),
+                "sender_user": {"id": 99, "is_bot": False, "first_name": "Sender"}
+            }
+        })
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertIn("Forwarded", reason)
+
+    def test_url_entity(self):
+        msg = types.Message(
+            message_id=3,
+            from_user=types.User(id=103, is_bot=False, first_name="Charlie"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Visit https://google.com for info"
+        url_entity = types.MessageEntity(type="url", offset=6, length=18)
+        msg.entities = [url_entity]
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertIn("Link entity", reason)
+
+    def test_mention_entity(self):
+        msg = types.Message(
+            message_id=4,
+            from_user=types.User(id=104, is_bot=False, first_name="Dave"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Contact @spam_bot now"
+        mention_ent = types.MessageEntity(type="mention", offset=8, length=9)
+        msg.entities = [mention_ent]
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertIn("Mention entity", reason)
+
+    def test_raw_regex_link(self):
+        msg = types.Message(
+            message_id=5,
+            from_user=types.User(id=105, is_bot=False, first_name="Eve"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Check t.me/free_crypto_channel"
+        msg.entities = []
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertEqual(reason, "URL or handle in message")
+
+
+class TestBioDeleteNoticeFormatting(unittest.TestCase):
+    def test_default_notice_contains_turtle(self):
+        user = types.User(id=12345, is_bot=False, first_name="John", username="johndoe")
+        notice = format_bio_delete_notice(None, user)
+        self.assertIn("@i_am_turtle", notice)
+        self.assertIn("@johndoe", notice)
+
+    def test_custom_notice_formatting(self):
+        user = types.User(id=67890, is_bot=False, first_name="Sarah", username=None)
+        custom_template = "Hey {mention} (ID: {id}), no links in bio! Contact @i_am_turtle for help."
+        notice = format_bio_delete_notice(custom_template, user)
+        self.assertIn("tg://user?id=67890", notice)
+        self.assertIn("67890", notice)
+        self.assertIn("@i_am_turtle", notice)
+
+
+class TestFreeLinksConfig(unittest.TestCase):
+    def test_free_links_isolation(self):
+        chat_id = -10099999999
+        config = get_group_config(chat_id)
+        self.assertIn("free_links", config)
+        self.assertIn("custom_bio_msg", config)
+
+        user_id = 555666777
+        config["free_links"].add(user_id)
+        self.assertIn(user_id, config["free_links"])
+        # Ensure free_links does not bleed into normal bio free_list
+        self.assertNotIn(user_id, config["free_list"])
+
+        config["free_links"].discard(user_id)
+        self.assertNotIn(user_id, config["free_links"])
 
 
 if __name__ == "__main__":
