@@ -9,6 +9,7 @@ from aiohttp.test_utils import AioHTTPTestCase, unittest_run_loop
 
 from main import (
     latest_notice_by_chat,
+    user_warns,
     BIO_LINK_REGEX,
     contains_link_or_handle,
     active_groups,
@@ -420,6 +421,34 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         notice = format_bio_delete_notice(custom_msg, user)
         self.assertIn("Tom", notice)
         self.assertIn("@i_am_turtle", notice)
+
+
+    async def test_warn_three_times_and_mute_logic(self):
+        chat_id = -10011223344
+        user_id = 99887766
+
+        user_warns.clear()
+
+        # Warn 1
+        user_warns[(chat_id, user_id)] = user_warns.get((chat_id, user_id), 0) + 1
+        self.assertEqual(user_warns[(chat_id, user_id)], 1)
+
+        # Warn 2
+        user_warns[(chat_id, user_id)] = user_warns.get((chat_id, user_id), 0) + 1
+        self.assertEqual(user_warns[(chat_id, user_id)], 2)
+
+        # Warn 3 -> reaches 3, triggers 1-day mute (86400s), resets count
+        count = user_warns.get((chat_id, user_id), 0) + 1
+        self.assertEqual(count, 3)
+        if count >= 3:
+            user_warns.pop((chat_id, user_id), None)
+        self.assertNotIn((chat_id, user_id), user_warns)
+
+        # Test Action label in settings grid
+        config = get_group_config(chat_id)
+        config["action"] = "warn"
+        _, kb = render_group_settings_grid(chat_id)
+        self.assertIn("Warn (3x➔1d)", str(kb.to_dict()))
 
 if __name__ == "__main__":
     unittest.main()

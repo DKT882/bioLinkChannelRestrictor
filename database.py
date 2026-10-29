@@ -451,6 +451,46 @@ class DatabaseManager:
         except Exception:
             return {"connected": True, "error": "Could not read metrics"}
 
+    async def increment_user_warns(self, chat_id: int, user_id: int) -> int:
+        """Increments and returns the user's warning count in a group."""
+        if not self.is_connected or self.db is None:
+            return 1
+        now = datetime.utcnow()
+        doc_id = f"{chat_id}_{user_id}"
+        try:
+            res = await self.db["user_warns"].find_one_and_update(
+                {"_id": doc_id},
+                {"$inc": {"warn_count": 1}, "$set": {"updated_at": now}},
+                upsert=True,
+                return_document=True
+            )
+            return res.get("warn_count", 1) if res else 1
+        except Exception as e:
+            logger.error(f"Failed to increment user warns in MongoDB: {e}")
+            return 1
+
+    async def reset_user_warns(self, chat_id: int, user_id: int):
+        """Resets the warning count for a user in a group."""
+        if not self.is_connected or self.db is None:
+            return
+        doc_id = f"{chat_id}_{user_id}"
+        try:
+            await self.db["user_warns"].delete_one({"_id": doc_id})
+        except Exception as e:
+            logger.error(f"Failed to reset user warns in MongoDB: {e}")
+
+    async def get_user_warns(self, chat_id: int, user_id: int) -> int:
+        """Gets the current warning count for a user in a group."""
+        if not self.is_connected or self.db is None:
+            return 0
+        doc_id = f"{chat_id}_{user_id}"
+        try:
+            doc = await self.db["user_warns"].find_one({"_id": doc_id})
+            return doc.get("warn_count", 0) if doc else 0
+        except Exception as e:
+            logger.error(f"Failed to get user warns from MongoDB: {e}")
+            return 0
+
     async def close(self):
         """Closes the MongoDB connection client."""
         if self.client:

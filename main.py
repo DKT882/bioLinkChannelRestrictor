@@ -129,6 +129,9 @@ latest_notice_by_chat: Dict[int, int] = {}
 # Pending custom message edits in Private DM: admin_user_id -> target_chat_id
 pending_custom_msg_edits: Dict[int, int] = {}
 
+# User warning counts: (chat_id, user_id) -> warning_count (1..3)
+user_warns: Dict[Tuple[int, int], int] = {}
+
 def load_settings() -> Dict[int, Dict[str, Any]]:
     """Loads saved settings from settings.json if present."""
     groups: Dict[int, Dict[str, Any]] = {}
@@ -606,7 +609,42 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
     # Step 3: Execute specific configured action if not default delete
     try:
         if action == "warn":
-            pass
+            current_warns = user_warns.get((chat_id, user.id), 0) + 1
+            user_warns[(chat_id, user.id)] = current_warns
+
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.increment_user_warns(chat_id, user.id))
+
+            if current_warns >= 3:
+                # 3 warnings reached -> Mute for 1 day (86400 seconds)
+                user_warns.pop((chat_id, user.id), None)
+                if db_manager.is_connected:
+                    asyncio.create_task(db_manager.reset_user_warns(chat_id, user.id))
+
+                mute_until = int(time.time()) + 86400  # 24 hours (1 day)
+                permissions = types.ChatPermissions(
+                    can_send_messages=False,
+                    can_send_media_messages=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False
+                )
+                await bot.restrict_chat_member(chat_id, user.id, permissions=permissions, until_date=mute_until)
+
+                mute_text = (
+                    f"🔇 {mention} reached <b>3/3 warnings</b> and has been <b>muted for 1 day (24 hours)</b>!\n"
+                    f"<b>Reason:</b> {html.escape(reason or 'Links or connected channel in profile bio')}\n\n"
+                    f"<i>Please remove violating links from your profile and contact @i_am_turtle to request unmuting.</i>"
+                )
+                warn_msg = await bot.send_message(chat_id, mute_text, parse_mode="HTML")
+                asyncio.create_task(auto_delete_message(chat_id, warn_msg.message_id, 30))
+            else:
+                warn_text = (
+                    f"⚠️ {mention} has received a warning! (<b>{current_warns}/3 warnings</b>)\n"
+                    f"<b>Reason:</b> {html.escape(reason or 'Link or connected channel in profile bio')}\n\n"
+                    f"<i>3 warnings = 1 day mute! Please remove links from your bio or contact @i_am_turtle for approval.</i>"
+                )
+                warn_msg = await bot.send_message(chat_id, warn_text, parse_mode="HTML")
+                asyncio.create_task(auto_delete_message(chat_id, warn_msg.message_id, 20))
 
         elif action == "mute":
             permissions = types.ChatPermissions(
@@ -778,7 +816,8 @@ def render_group_settings_grid(chat_id: int) -> Tuple[str, types.InlineKeyboardM
     markup.row(btn_bio, btn_chat_links)
 
     # Row 2: Punishment action cycler | Admin filter toggle
-    btn_action = types.InlineKeyboardButton(f"⚖️ Action: {action.capitalize()}", callback_data=f"cycle_act_{chat_id}")
+    action_label = "Warn (3x➔1d)" if action == "warn" else action.capitalize()
+    btn_action = types.InlineKeyboardButton(f"⚖️ Action: {action_label}", callback_data=f"cycle_act_{chat_id}")
     admin_label = "🛡️ Admins: Filter ON" if not ignore_admins else "🛡️ Admins: Exempt"
     btn_admins = types.InlineKeyboardButton(admin_label, callback_data=f"toggle_adm_{chat_id}")
     markup.row(btn_action, btn_admins)
@@ -1066,7 +1105,8 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
 
             text, markup = render_group_settings_grid(chat_id)
             await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
-            await bot.answer_callback_query(call.id, f"Action: {next_action.capitalize()}")
+            notice = "Action: Warn (3x ➔ 1d Mute)" if next_action == "warn" else f"Action: {next_action.capitalize()}"
+            await bot.answer_callback_query(call.id, notice)
         except Exception as e:
             logger.error(f"Error cycling action: {e}")
             await bot.answer_callback_query(call.id, "Could not update action.")
@@ -1352,7 +1392,7 @@ async def cmd_setaction(message: types.Message):
             f"<b>Current Action:</b> <code>{current_action}</code>\n\n"
             f"<b>Options:</b>\n"
             f"• <code>delete</code> - Deletes violating message & sends notice (Default)\n"
-            f"• <code>warn</code> - Deletes message and warns user in chat\n"
+            f"• <code>warn</code> - Deletes message & warns user (3 warnings ➔ Muted for 1 day)\n"
             f"• <code>mute</code> - Deletes message and mutes user\n"
             f"• <code>ban</code> - Deletes message and bans user"
         )
@@ -1373,7 +1413,7 @@ async def cmd_setaction(message: types.Message):
 
     action_descriptions = {
         "delete": "Delete violating messages and notify user to contact @i_am_turtle",
-        "warn": "Delete violating messages and warn user in chat",
+        "warn": "Delete violating messages and warn user (3 warnings = 1 day mute)",
         "mute": "Delete violating messages and mute user",
         "ban": "Delete violating messages and ban user from group"
     }
