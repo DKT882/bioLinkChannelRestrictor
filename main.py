@@ -89,7 +89,7 @@ BIO_LINK_REGEX = re.compile(
 )
 
 # Supported media & message types to intercept
-ALL_CONTENT_TYPES = telebot.util.content_type_media
+ALL_CONTENT_TYPES = telebot.util.content_type_media + telebot.util.content_type_service
 
 # Track process start time for uptime reporting
 START_TIME = time.time()
@@ -534,35 +534,44 @@ CHAT_HTML_LINK_REGEX = re.compile(r'<a\s+[^>]*href=["\']https?://', re.IGNORECAS
 
 def is_forwarded_message(message: types.Message) -> bool:
     """
-    Zero-overhead, microsecond check for forwarded messages.
-    Inspects Telegram attributes and raw JSON without unneeded deserialization.
+    Exhaustive, ultra-fast check for ANY forwarded message from ANY sender
+    (channel, group, bot, user, hidden user, automatic forward, or legacy forward).
+    Inspects Telegram attributes, dynamic properties, and raw JSON payload.
     """
-    if (getattr(message, "forward_date", None) is not None or
+    if message is None:
+        return False
+
+    # 1. Fast direct attribute check on deserialized Message object
+    if (getattr(message, "forward_origin", None) is not None or
+        getattr(message, "forward_date", None) is not None or
         getattr(message, "forward_from", None) is not None or
         getattr(message, "forward_from_chat", None) is not None or
         getattr(message, "forward_sender_name", None) is not None or
         getattr(message, "forward_signature", None) is not None or
-        getattr(message, "forward_origin", None) is not None or
+        getattr(message, "forward_from_message_id", None) is not None or
         getattr(message, "is_automatic_forward", None) is not None):
         return True
 
+    # 2. Dynamic check for any attribute starting with 'forward'
+    for attr in dir(message):
+        if attr.startswith("forward") and getattr(message, attr, None) is not None:
+            return True
+
+    # 3. Raw JSON dictionary inspection
     raw_json = getattr(message, "json", None)
     if not raw_json:
         return False
 
     if isinstance(raw_json, dict):
-        return bool(
-            raw_json.get("forward_date") is not None or
-            raw_json.get("forward_from") is not None or
-            raw_json.get("forward_from_chat") is not None or
-            raw_json.get("forward_sender_name") is not None or
-            raw_json.get("forward_signature") is not None or
-            raw_json.get("forward_origin") is not None or
-            raw_json.get("is_automatic_forward") is not None
-        )
+        if any(k.startswith("forward") and raw_json[k] is not None for k in raw_json):
+            return True
+        if raw_json.get("is_automatic_forward"):
+            return True
 
+    # 4. Raw JSON string inspection
     if isinstance(raw_json, str):
-        return bool('"forward_' in raw_json or '"is_automatic_forward"' in raw_json)
+        if "forward" in raw_json or "is_automatic_forward" in raw_json:
+            return True
 
     return False
 
@@ -2238,6 +2247,8 @@ async def handle_private_message(message: types.Message):
 
 @bot.message_handler(func=lambda msg: True, content_types=ALL_CONTENT_TYPES)
 @bot.edited_message_handler(func=lambda msg: True, content_types=ALL_CONTENT_TYPES)
+@bot.channel_post_handler(func=lambda msg: True, content_types=ALL_CONTENT_TYPES)
+@bot.edited_channel_post_handler(func=lambda msg: True, content_types=ALL_CONTENT_TYPES)
 async def process_chat_message(message: types.Message):
     """
     Core Filter Engine:
@@ -2250,63 +2261,39 @@ async def process_chat_message(message: types.Message):
     4. PRIORITY 2 - Profile Bio & Connected Channel Filter:
        - Scans bio/channel; executes configured punishment (delete/warn/mute/ban).
     """
-    # Filter 0: Only operate on groups & supergroups
-    if message.chat.type not in ("group", "supergroup"):
-        return
-
-    # Ignore command messages so command handlers handle them cleanly
-    if message.text and message.text.startswith("/"):
+    # Filter 0: Only operate on groups, supergroups, and channels
+    if message.chat.type not in ("group", "supergroup", "channel"):
         return
 
     chat_id = message.chat.id
-
-    # Filter 0b: Retrieve group configuration (ACTIVE BY DEFAULT ACROSS ALL GROUPS)
-    group_config = get_group_config(chat_id)
-    if not group_config.get("activated", True):
-        return
+    msg_id = message.message_id
 
     # Skip messages sent by this bot itself
     bot_id = bot_metadata.get("id")
     if message.from_user and bot_id and message.from_user.id == bot_id:
         return
 
-    # Check for Anonymous Admin (posted as chat channel or via AnonymousBot)
-    is_anon_admin = bool(
-        (message.sender_chat and message.sender_chat.id == chat_id) or
-        (message.from_user and message.from_user.id == ANONYMOUS_ADMIN_USER_ID)
-    )
-
-    if is_anon_admin:
-        if is_forwarded_message(message):
-            try:
-                await bot.delete_message(chat_id, message.message_id)
-            except TELEGRAM_EXCEPTIONS:
-                pass
-        return
-
-    # Sender ID resolution (handles regular user, external channel, or bot)
-    user_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else 0)
-    if not user_id:
-        return
-
     # --------------------------------------------------------------------------
     # Check 0: Forward Restriction (ABSOLUTE PRIORITY - ZERO EXEMPTIONS)
-    # NO ONE can send forwarded messages in the group:
+    # NO ONE can send forwarded messages:
     # Members, Admins, Free Admins, Free Members, and Owner are ALL strictly prohibited!
+    # Evaluated at the absolute top of the pipeline before commands, configs, or permissions.
     # --------------------------------------------------------------------------
     if is_forwarded_message(message):
         try:
-            await bot.delete_message(chat_id, message.message_id)
-        except TELEGRAM_EXCEPTIONS as e:
-            logger.warning(f"Could not delete forwarded message {message.message_id} in {chat_id}: {e}")
+            await bot.delete_message(chat_id, msg_id)
+            logger.info(f"[BioRestrictor] Successfully deleted forwarded message {msg_id} in {chat_id}")
+        except Exception as e:
+            logger.error(f"[BioRestrictor] FAILED TO DELETE forwarded message {msg_id} in {chat_id}: {e} (Verify bot is Admin with 'Delete Messages' right!)")
 
         if db_manager.is_connected:
+            u_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else 0)
             msg_content = message.text or message.caption or ""
             u_name = message.from_user.username if message.from_user else ""
             f_name = message.from_user.first_name if message.from_user else (message.sender_chat.title if message.sender_chat else "")
             asyncio.create_task(db_manager.log_moderation_event(
                 chat_id=chat_id,
-                user_id=user_id,
+                user_id=u_id,
                 username=u_name or "",
                 first_name=f_name or "",
                 is_admin=False,
@@ -2315,6 +2302,28 @@ async def process_chat_message(message: types.Message):
                 action_taken="delete",
                 message_text=msg_content
             ))
+        return
+
+    # Ignore command messages so command handlers handle them cleanly
+    if message.text and message.text.startswith("/"):
+        return
+
+    # Filter 0b: Retrieve group configuration (ACTIVE BY DEFAULT ACROSS ALL GROUPS)
+    group_config = get_group_config(chat_id)
+    if not group_config.get("activated", True):
+        return
+
+    # Check for Anonymous Admin (posted as chat channel or via AnonymousBot)
+    is_anon_admin = bool(
+        (message.sender_chat and message.sender_chat.id == chat_id) or
+        (message.from_user and message.from_user.id == ANONYMOUS_ADMIN_USER_ID)
+    )
+    if is_anon_admin:
+        return
+
+    # Sender ID resolution (handles regular user, external channel, or bot)
+    user_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else 0)
+    if not user_id:
         return
 
     # --------------------------------------------------------------------------
