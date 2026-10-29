@@ -330,7 +330,8 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Admins:", grid_buttons)
         self.assertIn("Bio Exempt", grid_buttons)
         self.assertIn("Link Allowed", grid_buttons)
-        self.assertIn("10s Notice Msg", grid_buttons)
+        self.assertIn("Notice:", grid_buttons)
+        self.assertIn("Edit Notice", grid_buttons)
         self.assertIn("Deleting Messages", grid_buttons)
         self.assertIn("Anti-Promotion", grid_buttons)
         self.assertIn("Approval Mode", grid_buttons)
@@ -391,6 +392,34 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         # After cleanup of 1002
         latest_notice_by_chat.pop(chat_id, None)
         self.assertNotIn(chat_id, latest_notice_by_chat)
+
+
+    async def test_notice_toggle_and_dm_custom_message(self):
+        chat_id = -10011223344
+        config = get_group_config(chat_id)
+
+        # 1. Notice toggle default is True
+        self.assertTrue(config["send_bio_notice"])
+        _, grid_kb = render_group_settings_grid(chat_id)
+        self.assertIn("Notice: ON", str(grid_kb.to_dict()))
+
+        # Toggle to False
+        config["send_bio_notice"] = False
+        _, grid_kb_off = render_group_settings_grid(chat_id)
+        self.assertIn("Notice: OFF", str(grid_kb_off.to_dict()))
+
+        # 2. Sub-view has Turn Notice ON button
+        sub_text, sub_kb = render_sub_setting(chat_id, "notice")
+        self.assertIn("Turn Notice ON", str(sub_kb.to_dict()))
+        self.assertIn("Set Custom Message", str(sub_kb.to_dict()))
+
+        # 3. Custom message formatting
+        user = types.User(id=333444, is_bot=False, first_name="Tom")
+        custom_msg = "Warning {mention}! Contact @i_am_turtle to get verified."
+        config["custom_bio_msg"] = custom_msg
+        notice = format_bio_delete_notice(custom_msg, user)
+        self.assertIn("Tom", notice)
+        self.assertIn("@i_am_turtle", notice)
 
 if __name__ == "__main__":
     unittest.main()

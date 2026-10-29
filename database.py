@@ -145,7 +145,8 @@ class DatabaseManager:
                     "custom_bio_msg": doc.get("custom_bio_msg", None),
                     "title": doc.get("title", ""),
                     "filter_links": doc.get("filter_links", True),
-                    "filter_bio": doc.get("filter_bio", True)
+                    "filter_bio": doc.get("filter_bio", True),
+                    "send_bio_notice": doc.get("send_bio_notice", True)
                 }
             logger.info(f"Loaded {len(groups_dict)} group(s) from MongoDB.")
         except Exception as e:
@@ -161,7 +162,8 @@ class DatabaseManager:
         ignore_admins: bool = False,
         custom_bio_msg: Optional[str] = None,
         filter_links: Optional[bool] = None,
-        filter_bio: Optional[bool] = None
+        filter_bio: Optional[bool] = None,
+        send_bio_notice: Optional[bool] = None
     ):
         """
         Persists or updates group settings in MongoDB atomically.
@@ -185,6 +187,8 @@ class DatabaseManager:
                 update_fields["filter_links"] = filter_links
             if filter_bio is not None:
                 update_fields["filter_bio"] = filter_bio
+            if send_bio_notice is not None:
+                update_fields["send_bio_notice"] = send_bio_notice
 
             await self.db["groups"].update_one(
                 {"_id": chat_id},
@@ -197,6 +201,7 @@ class DatabaseManager:
                         "exemptions_detail": [],
                         "filter_links": True,
                         "filter_bio": True,
+                        "send_bio_notice": True,
                         "created_at": now
                     }
                 },

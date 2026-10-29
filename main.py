@@ -126,6 +126,9 @@ in_flight_bio_scans: Dict[int, asyncio.Future] = {}
 # Ensures only the single latest notice stays in the group; older notices are immediately deleted
 latest_notice_by_chat: Dict[int, int] = {}
 
+# Pending custom message edits in Private DM: admin_user_id -> target_chat_id
+pending_custom_msg_edits: Dict[int, int] = {}
+
 def load_settings() -> Dict[int, Dict[str, Any]]:
     """Loads saved settings from settings.json if present."""
     groups: Dict[int, Dict[str, Any]] = {}
@@ -144,7 +147,9 @@ def load_settings() -> Dict[int, Dict[str, Any]]:
                         "custom_bio_msg": cfg.get("custom_bio_msg", None),
                         "title": cfg.get("title", ""),
                         "filter_links": cfg.get("filter_links", True),
-                        "filter_bio": cfg.get("filter_bio", True)
+                        "filter_bio": cfg.get("filter_bio", True),
+                "send_bio_notice": cfg.get("send_bio_notice", True),
+                        "send_bio_notice": cfg.get("send_bio_notice", True)
                     }
             logger.info(f"Loaded persistent configurations for {len(groups)} group(s).")
         except Exception as e:
@@ -198,7 +203,8 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
             "custom_bio_msg": None,
             "title": "",
             "filter_links": True,
-            "filter_bio": True
+            "filter_bio": True,
+            "send_bio_notice": True
         }
         save_settings()
         if db_manager.is_connected:
@@ -223,6 +229,8 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
         cfg["filter_links"] = True
     if "filter_bio" not in cfg:
         cfg["filter_bio"] = True
+    if "send_bio_notice" not in cfg:
+        cfg["send_bio_notice"] = True
     return cfg
 
 # ------------------------------------------------------------------------------
@@ -561,34 +569,35 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
 
     # Step 2: Send mentioned notice explaining the bio/channel deletion and approval contact (@i_am_turtle)
     group_config = get_group_config(chat_id)
-    custom_msg = group_config.get("custom_bio_msg")
-    notice_text = format_bio_delete_notice(custom_msg, user)
-    try:
-        # User requirement: Delete old notification when new/latest notification arrives; keep ONLY the latest
-        old_notice_id = latest_notice_by_chat.get(chat_id)
-        if old_notice_id:
-            try:
-                await bot.delete_message(chat_id, old_notice_id)
-            except Exception:
-                pass
+    if group_config.get("send_bio_notice", True):
+        custom_msg = group_config.get("custom_bio_msg")
+        notice_text = format_bio_delete_notice(custom_msg, user)
+        try:
+            # User requirement: Delete old notification when new/latest notification arrives; keep ONLY the latest
+            old_notice_id = latest_notice_by_chat.get(chat_id)
+            if old_notice_id:
+                try:
+                    await bot.delete_message(chat_id, old_notice_id)
+                except Exception:
+                    pass
 
-        notice_msg = await bot.send_message(chat_id, notice_text, parse_mode="HTML")
-        latest_notice_by_chat[chat_id] = notice_msg.message_id
+            notice_msg = await bot.send_message(chat_id, notice_text, parse_mode="HTML")
+            latest_notice_by_chat[chat_id] = notice_msg.message_id
 
-        # User requirement: Auto-delete the latest notification in exactly 10 seconds
-        async def _cleanup_latest_notice(c_id: int, m_id: int):
-            await asyncio.sleep(10)
-            try:
-                await bot.delete_message(c_id, m_id)
-            except Exception:
-                pass
-            finally:
-                if latest_notice_by_chat.get(c_id) == m_id:
-                    latest_notice_by_chat.pop(c_id, None)
+            # User requirement: Auto-delete the latest notification in exactly 10 seconds
+            async def _cleanup_latest_notice(c_id: int, m_id: int):
+                await asyncio.sleep(10)
+                try:
+                    await bot.delete_message(c_id, m_id)
+                except Exception:
+                    pass
+                finally:
+                    if latest_notice_by_chat.get(c_id) == m_id:
+                        latest_notice_by_chat.pop(c_id, None)
 
-        asyncio.create_task(_cleanup_latest_notice(chat_id, notice_msg.message_id))
-    except Exception as e:
-        logger.warning(f"Could not deliver bio violation notice in {chat_id}: {e}")
+            asyncio.create_task(_cleanup_latest_notice(chat_id, notice_msg.message_id))
+        except Exception as e:
+            logger.warning(f"Could not deliver bio violation notice in {chat_id}: {e}")
 
     # If action is 'delete', we are done (message deleted + notice sent)
     if action == "delete":
@@ -779,15 +788,21 @@ def render_group_settings_grid(chat_id: int) -> Tuple[str, types.InlineKeyboardM
     btn_free_links = types.InlineKeyboardButton(f"🔗 Link Allowed ({link_count})", callback_data=f"sub_freel_{chat_id}")
     markup.row(btn_free, btn_free_links)
 
-    # Row 4: Bio notice message | Deleting messages info
-    btn_notice = types.InlineKeyboardButton("📢 10s Notice Msg", callback_data=f"sub_notice_{chat_id}")
-    btn_delmsg = types.InlineKeyboardButton("🗑 Deleting Messages", callback_data=f"sub_delmsg_{chat_id}")
-    markup.row(btn_notice, btn_delmsg)
+    # Row 4: Deletion Notice Toggle & Custom Edit
+    send_notice = config.get("send_bio_notice", True)
+    notice_label = f"📢 Notice: {'ON ✅' if send_notice else 'OFF ❌'}"
+    btn_notice_toggle = types.InlineKeyboardButton(notice_label, callback_data=f"toggle_notice_{chat_id}")
+    btn_notice_edit = types.InlineKeyboardButton("✏️ Edit Notice", callback_data=f"sub_notice_{chat_id}")
+    markup.row(btn_notice_toggle, btn_notice_edit)
 
-    # Row 5: Anti-Promotion | Approval Mode
+    # Row 5: Deleting Messages info | Anti-Promotion
+    btn_delmsg = types.InlineKeyboardButton("🗑 Deleting Messages", callback_data=f"sub_delmsg_{chat_id}")
     btn_antipromo = types.InlineKeyboardButton("🕵️‍♂️ Anti-Promotion", callback_data=f"sub_promo_{chat_id}")
+    markup.row(btn_delmsg, btn_antipromo)
+
+    # Row 6: Approval Mode
     btn_support = types.InlineKeyboardButton("🎛 Approval Mode", callback_data=f"sub_apprv_{chat_id}")
-    markup.row(btn_antipromo, btn_support)
+    markup.row(btn_support)
 
     # Bottom Row: Back | Close | Reload (matching Images 1 & 4 bottom bar)
     btn_back = types.InlineKeyboardButton("⬅️ Back", callback_data="mng_groups")
@@ -864,19 +879,28 @@ def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.InlineKe
         )
     elif sub_type == "notice":
         custom_msg = config.get("custom_bio_msg")
+        send_notice = config.get("send_bio_notice", True)
         status_label = "Custom" if custom_msg else "Default (@i_am_turtle)"
         current_text = custom_msg or DEFAULT_BIO_DELETE_MSG
+        notice_mode = "Active ✅ (10s auto-delete)" if send_notice else "Disabled ❌ (Silent deletion mode)"
         text = (
             f"📢 <b>Bio Deletion Notice ({status_label})</b>\n"
             f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"• <b>Status:</b> <code>{notice_mode}</code>\n"
+            f"• <b>Auto-Delete Timer:</b> 10 seconds\n"
+            f"• <b>Notice Replacement:</b> Keeps only the single latest notification in the group\n\n"
             f"<b>Current Active Notice:</b>\n"
             f"{html.escape(current_text)}\n\n"
-            f"• <b>Auto-Delete Timer:</b> 10 seconds\n"
-            f"• <b>Active Notice:</b> Only latest notification kept (older notices deleted immediately)\n\n"
-            f"<b>Commands to customize:</b>\n"
-            f"• <code>/setmsg &lt;your message&gt;</code> - Set custom message\n"
-            f"• <code>/resetmsg</code> - Reset back to default"
+            f"<i>Use the buttons below to toggle this notification ON/OFF, or edit the message directly in this chat.</i>"
         )
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        toggle_label = "🔴 Turn Notice OFF (Silent Mode)" if send_notice else "🟢 Turn Notice ON (Send Notice)"
+        markup.add(types.InlineKeyboardButton(toggle_label, callback_data=f"toggle_notice_{chat_id}"))
+        markup.add(types.InlineKeyboardButton("✍️ Set Custom Message", callback_data=f"edit_notice_{chat_id}"))
+        if custom_msg:
+            markup.add(types.InlineKeyboardButton("🔄 Reset to Default Message", callback_data=f"reset_notice_{chat_id}"))
+        markup.add(types.InlineKeyboardButton("⬅️ Back to Settings", callback_data=f"grp_{chat_id}"))
+        return text, markup
     elif sub_type == "delmsg":
         text = (
             f"🗑 <b>Deleting Messages Engine</b>\n"
@@ -1131,6 +1155,89 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
         except Exception as e:
             logger.error(f"Error toggling bio filter: {e}")
             await bot.answer_callback_query(call.id, "Could not toggle bio filter.")
+        return
+
+    # 8d. Toggle Bio Deletion Notice ON/OFF
+    if data.startswith("toggle_notice_"):
+        try:
+            chat_id = int(data.split("_")[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            config = get_group_config(chat_id)
+            new_state = not config.get("send_bio_notice", True)
+            config["send_bio_notice"] = new_state
+            save_settings()
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, send_bio_notice=new_state))
+
+            msg_text = call.message.text or ""
+            if "Bio Deletion Notice" in msg_text:
+                text, markup = render_sub_setting(chat_id, "notice")
+            else:
+                text, markup = render_group_settings_grid(chat_id)
+
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            notice = "📢 Deletion Notice: ENABLED (10s)" if new_state else "📢 Deletion Notice: DISABLED (Silent)"
+            await bot.answer_callback_query(call.id, notice)
+        except Exception as e:
+            logger.error(f"Error toggling notice: {e}")
+            await bot.answer_callback_query(call.id, "Could not toggle notice.")
+        return
+
+    # 8e. Edit Bio Deletion Notice in Private DM
+    if data.startswith("edit_notice_"):
+        try:
+            chat_id = int(data.split("_")[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            pending_custom_msg_edits[user.id] = chat_id
+            config = get_group_config(chat_id)
+            title = config.get("title") or f"Group {chat_id}"
+
+            prompt_text = (
+                f"✍️ <b>Customize Bio Deletion Notice</b>\n"
+                f"<b>Group:</b> {html.escape(title)}\n\n"
+                f"Send your new custom response message in this chat now.\n\n"
+                f"<b>Available Placeholders:</b>\n"
+                f"• <code>{{mention}}</code> - Clickable user mention\n"
+                f"• <code>{{name}}</code> - User's first name\n"
+                f"• <code>{{id}}</code> - Numeric Telegram user ID\n\n"
+                f"<i>Send your text now, or tap Cancel below:</i>"
+            )
+            markup = types.InlineKeyboardMarkup()
+            markup.add(types.InlineKeyboardButton("❌ Cancel", callback_data=f"sub_notice_{chat_id}"))
+
+            await bot.edit_message_text(prompt_text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            await bot.answer_callback_query(call.id, "Type your custom message in this chat")
+        except Exception as e:
+            logger.error(f"Error starting edit notice: {e}")
+            await bot.answer_callback_query(call.id, "Could not start edit.")
+        return
+
+    # 8f. Reset Bio Deletion Notice to Default
+    if data.startswith("reset_notice_"):
+        try:
+            chat_id = int(data.split("_")[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            config = get_group_config(chat_id)
+            config["custom_bio_msg"] = None
+            save_settings()
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.reset_custom_bio_msg(chat_id))
+
+            text, markup = render_sub_setting(chat_id, "notice")
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            await bot.answer_callback_query(call.id, "Notice reset to default (@i_am_turtle)")
+        except Exception as e:
+            logger.error(f"Error resetting notice: {e}")
+            await bot.answer_callback_query(call.id, "Could not reset notice.")
         return
 
     # 9. Sub-setting Views (sub_bio, sub_links, sub_free, sub_freel, sub_notice, sub_delmsg, sub_promo, sub_apprv)
@@ -1897,10 +2004,40 @@ async def handle_private_message(message: types.Message):
     If any admin, anonymous admin, or owner sends a private message to the bot,
     the bot returns the Group Help-style interactive dashboard
     showing all connected groups where the user is an administrator.
+    If the user was prompted to edit a custom bio notice, saves the custom message!
     """
     if message.text and message.text.startswith("/"):
         # Let command handlers process commands
         return
+
+    user_id = message.from_user.id if message.from_user else 0
+
+    # Check if this admin is in the middle of editing a group's custom notice in DM
+    if user_id in pending_custom_msg_edits:
+        target_chat_id = pending_custom_msg_edits.pop(user_id)
+        new_text = message.text.strip()
+        config = get_group_config(target_chat_id)
+        config["custom_bio_msg"] = new_text
+        save_settings()
+        if db_manager.is_connected:
+            asyncio.create_task(db_manager.set_custom_bio_msg(target_chat_id, new_text))
+
+        preview = format_bio_delete_notice(new_text, message.from_user)
+        title = config.get("title") or f"Group {target_chat_id}"
+        resp_text = (
+            f"✅ <b>Custom Bio Deletion Notice Saved!</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"<b>Live Preview:</b>\n"
+            f"{preview}"
+        )
+        markup = types.InlineKeyboardMarkup(row_width=1)
+        markup.add(
+            types.InlineKeyboardButton("📢 Notice Settings", callback_data=f"sub_notice_{target_chat_id}"),
+            types.InlineKeyboardButton("⚙️ Group Settings", callback_data=f"grp_{target_chat_id}")
+        )
+        await bot.send_message(message.chat.id, resp_text, parse_mode="HTML", reply_markup=markup)
+        return
+
     text, keyboard = await render_groups_list(message.from_user)
     await bot.send_message(message.chat.id, text, parse_mode="HTML", reply_markup=keyboard)
 
