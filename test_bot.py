@@ -314,6 +314,32 @@ class TestChatLinkDetection(unittest.TestCase):
         self.assertTrue(has_link)
         self.assertEqual(reason, "URL or handle in message")
 
+    def test_multi_table_forwarded_porn_spam(self):
+        # Exact emulation of the screenshot: forwarded spam message with 2 tables of buttons
+        json_data = {
+            'message_id': 99,
+            'from': {'id': 201, 'is_bot': False, 'first_name': 'Mithila'},
+            'chat': {'id': -1001, 'type': 'supergroup'},
+            'date': int(time.time()),
+            'forward_date': int(time.time()) - 30,
+            'forward_sender_name': 'Nina 💕 (Cameron Cang)',
+            'text': 'NGẮM GÁI XINH FRESH 2026\n\nTap to Access Full Collection ⤵️',
+            'reply_markup': {
+                'inline_keyboard': [
+                    [{'text': '💥 PRESS RIGHT NOW', 'url': 'https://t.me/ch1'}, {'text': '🔥 STREAM NOW', 'url': 'https://t.me/ch2'}],
+                    [{'text': '🔒 JOIN INSTANTLY', 'url': 'https://t.me/ch3'}, {'text': '🎁 CLAIM ALL', 'url': 'https://t.me/ch4'}],
+                    [{'text': '⚡ ACCESS UNLOCKED', 'url': 'https://t.me/ch5'}, {'text': '✨ WATCH IT ALL', 'url': 'https://t.me/ch6'}],
+                    [{'text': '💥 🪽 PRESS THIS SECOND 🪽 💥 ↗️', 'url': 'https://t.me/ch7'}],
+                    [{'text': '💥 🪽 STREAM LIVE 🪽 💥 ↗️', 'url': 'https://t.me/ch8'}],
+                    [{'text': '💥 🪽 SEE EVERYTHING 🪽 💥 ↗️', 'url': 'https://t.me/ch9'}]
+                ]
+            }
+        }
+        msg = types.Message.de_json(json_data)
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertTrue("Inline table link button" in reason or "Forwarded" in reason)
+
     def test_raw_regex_link(self):
         msg = types.Message(
             message_id=5,
