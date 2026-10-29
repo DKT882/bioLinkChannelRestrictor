@@ -65,7 +65,7 @@ ANONYMOUS_ADMIN_USER_ID = 1087968824
 
 # Cache TTL settings (optimized for 15,000+ member high-traffic groups)
 ADMIN_CACHE_TTL = 300.0   # 5 minutes for chat admins
-BIO_CACHE_TTL = 900.0     # 15 minutes for user bio scans (reduces API load by ~70%)
+BIO_CACHE_TTL = 30.0     # 30 seconds for responsive bio updates & testing
 CACHE_PRUNE_INTERVAL = 600.0  # 10 minutes between cache prunes
 
 # Regular expression designed to detect promotional links, invite links, and handles:
@@ -1995,6 +1995,7 @@ async def cmd_reload(message: types.Message):
 
     # Invalidate cached admins to force fresh fetch
     admin_cache.pop(chat.id, None)
+    bio_cache.clear()  # Invalidate bio cache to force fresh scan
 
     # Update title in active_groups
     config = get_group_config(chat.id)
@@ -2266,23 +2267,19 @@ async def process_chat_message(message: types.Message):
         if user_id in free_list:
             return
 
-        # Fast Check 2b: Skip admins ONLY IF ignore_admins is True (Default: False / Admins are scanned)
+        # Fast Check 2b: Skip admins & owner ONLY IF ignore_admins is True (Default: False / Admins & Owner are scanned)
         if group_config.get("ignore_admins", False):
             if await is_user_admin(chat_id, user_id, message):
                 return
 
-        # Fast Check 2c: Group Owner is always exempt from bio scan
-        if await is_owner_or_anonymous_admin(chat_id, user_id, message):
-            return
-
-        # Bio & Connected Channel Scan
+        # Bio & Connected Channel Scan (detects t.me links, promotional URLs, @handles, personal channels)
         has_violation, reason = await scan_user_bio(user_id)
         if not has_violation:
             return
 
-        # Action Trigger: User or Admin has a link, handle, or connected channel!
+        # Action Trigger: User, Admin, or Owner has a bio link or connected channel!
         configured_action = group_config.get("action", "delete")
-        asyncio.create_task(execute_action(message, configured_action, reason))
+        await execute_action(message, configured_action, reason)
 
 
 # ------------------------------------------------------------------------------

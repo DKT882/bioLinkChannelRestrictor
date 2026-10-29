@@ -30,7 +30,9 @@ from main import (
     render_welcome_screen,
     render_groups_selector,
     render_group_settings_grid,
-    render_sub_setting
+    render_sub_setting,
+    bot,
+    process_chat_message
 )
 from telebot import types
 
@@ -555,6 +557,37 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         config["action"] = "warn"
         _, kb = render_group_settings_grid(chat_id)
         self.assertIn("Warn (3x➔1d)", str(kb.to_dict()))
+
+    async def test_owner_and_member_bio_link_deletion(self):
+        from unittest.mock import AsyncMock, patch
+        chat_id = -100998877
+        user_id = 88776655
+        config = get_group_config(chat_id)
+        config["ignore_admins"] = False
+        config["action"] = "delete"
+
+        mock_chat = types.Chat.de_json({
+            "id": user_id,
+            "type": "private",
+            "bio": "Join my channel t.me/us_roots"
+        })
+        msg = types.Message.de_json({
+            "message_id": 777,
+            "from": {"id": user_id, "is_bot": False, "first_name": "TestUser"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "Hello group"
+        })
+
+        admin_cache[chat_id] = ({user_id}, user_id, time.monotonic() + 300)
+        bio_cache.clear()
+
+        with patch.object(bot, "get_chat", new=AsyncMock(return_value=mock_chat)), \
+             patch.object(bot, "delete_message", new=AsyncMock()) as mock_del, \
+             patch.object(bot, "send_message", new=AsyncMock()) as mock_send:
+            mock_send.return_value = types.Message.de_json({"message_id": 888, "date": int(time.time()), "chat": {"id": chat_id, "type": "supergroup"}})
+            await process_chat_message(msg)
+            self.assertTrue(mock_del.called)
 
 if __name__ == "__main__":
     unittest.main()
