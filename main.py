@@ -504,6 +504,42 @@ def schedule_command_cleanup(message: types.Message, delay: int = 3):
 CHAT_MARKDOWN_LINK_REGEX = re.compile(r'\[.*?\]\(https?://\S+\)', re.IGNORECASE)
 CHAT_HTML_LINK_REGEX = re.compile(r'<a\s+[^>]*href=["\']https?://', re.IGNORECASE)
 
+def is_forwarded_message(message: types.Message) -> bool:
+    """
+    Ultra-fast check if a message is forwarded from any user, bot, channel,
+    group, hidden sender, signature, or modern forward_origin.
+    Checks both Telegram object attributes and raw JSON payload.
+    """
+    if (getattr(message, "forward_date", None) is not None or
+        getattr(message, "forward_from", None) is not None or
+        getattr(message, "forward_from_chat", None) is not None or
+        getattr(message, "forward_sender_name", None) is not None or
+        getattr(message, "forward_signature", None) is not None or
+        getattr(message, "forward_origin", None) is not None or
+        getattr(message, "is_automatic_forward", None) is not None):
+        return True
+
+    raw_json = getattr(message, "json", {})
+    if isinstance(raw_json, str):
+        try:
+            raw_json = json.loads(raw_json)
+        except Exception:
+            raw_json = {}
+    elif not isinstance(raw_json, dict):
+        raw_json = {}
+
+    if (raw_json.get("forward_date") is not None or
+        raw_json.get("forward_from") is not None or
+        raw_json.get("forward_from_chat") is not None or
+        raw_json.get("forward_sender_name") is not None or
+        raw_json.get("forward_signature") is not None or
+        raw_json.get("forward_origin") is not None or
+        raw_json.get("is_automatic_forward") is not None):
+        return True
+
+    return False
+
+
 def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
     """
     Ultra-fast scanner for all kinds of in-chat links, forwards, mentions,
@@ -522,21 +558,7 @@ def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
         raw_json = {}
 
     # 1. Forward check (from user, bot, channel, group, hidden sender, signature, or forward_origin)
-    # Check both Message object attributes and raw json dict for comprehensive detection
-    if (getattr(message, "forward_date", None) is not None or
-        getattr(message, "forward_from", None) is not None or
-        getattr(message, "forward_from_chat", None) is not None or
-        getattr(message, "forward_sender_name", None) is not None or
-        getattr(message, "forward_signature", None) is not None or
-        getattr(message, "forward_origin", None) is not None or
-        getattr(message, "is_automatic_forward", None) is not None or
-        raw_json.get("forward_date") is not None or
-        raw_json.get("forward_from") is not None or
-        raw_json.get("forward_from_chat") is not None or
-        raw_json.get("forward_sender_name") is not None or
-        raw_json.get("forward_signature") is not None or
-        raw_json.get("forward_origin") is not None or
-        raw_json.get("is_automatic_forward") is not None):
+    if is_forwarded_message(message):
         return True, "Forwarded message"
 
     # 2. Table Links & Inline Keyboard Buttons
@@ -2228,6 +2250,11 @@ async def process_chat_message(message: types.Message):
     )
 
     if is_anon_admin:
+        if is_forwarded_message(message):
+            try:
+                await bot.delete_message(chat_id, message.message_id)
+            except TELEGRAM_EXCEPTIONS:
+                pass
         return
 
     # Sender ID resolution (handles regular user, external channel, or bot)
@@ -2236,19 +2263,52 @@ async def process_chat_message(message: types.Message):
         return
 
     # --------------------------------------------------------------------------
-    # Check 1: In-Chat Link & Forward Restriction (PRIORITY 1 - INSTANT SCAN)
+    # Check 0: Forward Restriction (ABSOLUTE PRIORITY - ZERO EXEMPTIONS)
+    # NO ONE can send forwarded messages in the group:
+    # Members, Admins, Free Admins, Free Members, and Owner are ALL strictly prohibited!
+    # --------------------------------------------------------------------------
+    if is_forwarded_message(message):
+        try:
+            await bot.delete_message(chat_id, message.message_id)
+        except TELEGRAM_EXCEPTIONS as e:
+            logger.warning(f"Could not delete forwarded message {message.message_id} in {chat_id}: {e}")
+
+        if db_manager.is_connected:
+            msg_content = message.text or message.caption or ""
+            u_name = message.from_user.username if message.from_user else ""
+            f_name = message.from_user.first_name if message.from_user else (message.sender_chat.title if message.sender_chat else "")
+            asyncio.create_task(db_manager.log_moderation_event(
+                chat_id=chat_id,
+                user_id=user_id,
+                username=u_name or "",
+                first_name=f_name or "",
+                is_admin=False,
+                violation_type="forwarded_message",
+                violation_detail="Forwarded message (no senders allowed)",
+                action_taken="delete",
+                message_text=msg_content
+            ))
+        return
+
+    # --------------------------------------------------------------------------
+    # Check 1: In-Chat Link & Table Button Restriction (PRIORITY 1 - INSTANT SCAN)
     # --------------------------------------------------------------------------
     if group_config.get("filter_links", True):
         has_chat_link, link_reason = detect_chat_link(message)
         if has_chat_link:
-            free_links: Set[int] = group_config.get("free_links", set())
-            is_link_allowed = (user_id in free_links)
+            # Inline keyboard buttons (spam button tables) also have ZERO exemption
+            is_table_button = "Inline" in link_reason
+            if is_table_button:
+                is_link_allowed = False
+            else:
+                free_links: Set[int] = group_config.get("free_links", set())
+                is_link_allowed = (user_id in free_links)
 
-            if not is_link_allowed:
-                # Admins and Owner are exempt from in-chat link filter ONLY if ignore_admins is True
-                if group_config.get("ignore_admins", False):
-                    if await is_user_admin(chat_id, user_id, message):
-                        is_link_allowed = True
+                if not is_link_allowed:
+                    # Admins and Owner are exempt from standard in-chat link filter ONLY if ignore_admins is True
+                    if group_config.get("ignore_admins", False):
+                        if await is_user_admin(chat_id, user_id, message):
+                            is_link_allowed = True
 
             if not is_link_allowed:
                 # INSTANT PRIORITY DELETION:

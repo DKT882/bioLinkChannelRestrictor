@@ -739,5 +739,48 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
             # Message 2 should NOT be deleted because user removed link from bio!
             self.assertFalse(mock_del2.called, "Clean user must NOT be deleted after removing bio link")
 
+    async def test_zero_exemption_forward_all_roles(self):
+        """
+        Verifies that NO ONE can send forwarded messages:
+        Regular members, Admins, Free Members, Free Admins, and Owner are ALL deleted!
+        """
+        from unittest.mock import AsyncMock, patch
+        chat_id = -100990099
+        owner_id = 11111
+        admin_id = 22222
+        free_admin_id = 33333
+        free_member_id = 44444
+        regular_member_id = 55555
+
+        config = get_group_config(chat_id)
+        config["ignore_admins"] = True  # Even if Admins: Filter OFF!
+        config["free_links"] = {free_admin_id, free_member_id}
+        config["free_list"] = {free_admin_id, free_member_id}
+
+        admin_cache[chat_id] = ({owner_id, admin_id, free_admin_id}, owner_id, time.monotonic() + 300)
+
+        test_senders = [
+            ("Owner", owner_id),
+            ("Admin", admin_id),
+            ("Free Admin", free_admin_id),
+            ("Free Member", free_member_id),
+            ("Regular Member", regular_member_id)
+        ]
+
+        for role_name, uid in test_senders:
+            msg = types.Message.de_json({
+                "message_id": 7000 + uid % 1000,
+                "from": {"id": uid, "is_bot": False, "first_name": f"User_{role_name}"},
+                "chat": {"id": chat_id, "type": "supergroup"},
+                "date": int(time.time()),
+                "text": f"Forwarded post sent by {role_name}",
+                "forward_date": int(time.time()) - 20,
+                "forward_sender_name": "Origin Channel"
+            })
+
+            with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del:
+                await process_chat_message(msg)
+                self.assertTrue(mock_del.called, f"Forwarded message sent by {role_name} MUST be deleted with zero exemption!")
+
 if __name__ == "__main__":
     unittest.main()
