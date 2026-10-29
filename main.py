@@ -88,11 +88,7 @@ BIO_LINK_REGEX = re.compile(
 )
 
 # Supported media & message types to intercept
-ALL_CONTENT_TYPES = [
-    "text", "audio", "document", "photo", "sticker", "video",
-    "video_note", "voice", "location", "contact", "animation",
-    "poll", "dice"
-]
+ALL_CONTENT_TYPES = telebot.util.content_type_media
 
 # Track process start time for uptime reporting
 START_TIME = time.time()
@@ -410,7 +406,7 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
             chan_title = getattr(personal_chat, "title", "Connected Channel")
             chan_str = f"@{chan_name}" if chan_name else f"'{chan_title}'"
             reason = f"Connected channel on profile: {chan_str}"
-            bio_cache[user_id] = (True, reason, now + BIO_CACHE_TTL)
+            bio_cache[user_id] = (True, reason, now + 2.0)
             if not future.done():
                 future.set_result((True, reason))
             logger.info(f"User {user_id} flagged: {reason}")
@@ -432,7 +428,7 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
 
         if bio_text and BIO_LINK_REGEX.search(bio_text):
             reason = f"Link or channel handle in bio: {bio_text!r}"
-            bio_cache[user_id] = (True, reason, now + BIO_CACHE_TTL)
+            bio_cache[user_id] = (True, reason, now + 2.0)
             if not future.done():
                 future.set_result((True, reason))
             logger.info(f"User {user_id} flagged: {reason}")
@@ -515,37 +511,69 @@ def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
     multiple links, telegram deep links, markdown/HTML links, and contact info.
     Returns (has_link: bool, reason: str).
     """
+# 0. Extract raw JSON dictionary fallback for complete cross-version compatibility
+    raw_json = getattr(message, "json", {})
+    if isinstance(raw_json, str):
+        try:
+            raw_json = json.loads(raw_json)
+        except Exception:
+            raw_json = {}
+    elif not isinstance(raw_json, dict):
+        raw_json = {}
+
     # 1. Forward check (from user, bot, channel, group, hidden sender, signature, or forward_origin)
-    if message.forward_date is not None:
+    # Check both Message object attributes and raw json dict for comprehensive detection
+    if (getattr(message, "forward_date", None) is not None or
+        getattr(message, "forward_from", None) is not None or
+        getattr(message, "forward_from_chat", None) is not None or
+        getattr(message, "forward_sender_name", None) is not None or
+        getattr(message, "forward_signature", None) is not None or
+        getattr(message, "forward_origin", None) is not None or
+        getattr(message, "is_automatic_forward", None) is not None or
+        raw_json.get("forward_date") is not None or
+        raw_json.get("forward_from") is not None or
+        raw_json.get("forward_from_chat") is not None or
+        raw_json.get("forward_sender_name") is not None or
+        raw_json.get("forward_signature") is not None or
+        raw_json.get("forward_origin") is not None or
+        raw_json.get("is_automatic_forward") is not None):
         return True, "Forwarded message"
-    if getattr(message, "forward_from", None) is not None:
-        return True, "Forwarded message (from user/bot)"
-    if getattr(message, "forward_from_chat", None) is not None:
-        return True, "Forwarded message (from channel/group)"
-    if getattr(message, "forward_sender_name", None) is not None:
-        return True, "Forwarded message (from hidden sender)"
-    if getattr(message, "forward_signature", None) is not None:
-        return True, "Forwarded message (channel signature)"
-    if getattr(message, "forward_origin", None) is not None:
-        return True, "Forwarded message (forward_origin)"
 
     # 2. Table Links & Inline Keyboard Buttons
     # Detects button tables/grids containing URLs, web apps, or switch query spam
-    if getattr(message, "reply_markup", None) is not None:
-        rm = message.reply_markup
-        inline_rows = getattr(rm, "keyboard", None) or getattr(rm, "inline_keyboard", None) or []
+    rm = getattr(message, "reply_markup", None)
+    if rm is None and isinstance(raw_json, dict):
+        rm = raw_json.get("reply_markup")
+
+    if rm is not None:
+        if isinstance(rm, dict):
+            inline_rows = rm.get("inline_keyboard", [])
+        else:
+            inline_rows = getattr(rm, "keyboard", None) or getattr(rm, "inline_keyboard", None) or []
         for row in inline_rows:
             for btn in row:
-                btn_url = getattr(btn, "url", None)
-                if btn_url:
-                    return True, f"Inline table link button ({btn_url})"
-                if getattr(btn, "web_app", None):
-                    return True, "Inline button Web App link"
-                if getattr(btn, "login_url", None):
-                    return True, "Inline button login URL"
-                if getattr(btn, "switch_inline_query", None) is not None or getattr(btn, "switch_inline_query_current_chat", None) is not None:
-                    return True, "Inline button switch query"
+                if isinstance(btn, dict):
+                    btn_url = btn.get("url")
+                    if btn_url:
+                        return True, f"Inline table link button ({btn_url})"
+                    if btn.get("web_app"):
+                        return True, "Inline button Web App link"
+                    if btn.get("login_url"):
+                        return True, "Inline button login URL"
+                    if btn.get("switch_inline_query") is not None or btn.get("switch_inline_query_current_chat") is not None:
+                        return True, "Inline button switch query"
+                else:
+                    btn_url = getattr(btn, "url", None)
+                    if btn_url:
+                        return True, f"Inline table link button ({btn_url})"
+                    if getattr(btn, "web_app", None):
+                        return True, "Inline button Web App link"
+                    if getattr(btn, "login_url", None):
+                        return True, "Inline button login URL"
+                    if getattr(btn, "switch_inline_query", None) is not None or getattr(btn, "switch_inline_query_current_chat", None) is not None:
+                        return True, "Inline button switch query"
                 return True, "Inline keyboard table button"
+
 
     # 3. Message sent via Inline Bot (@bot query)
     if getattr(message, "via_bot", None) is not None:
@@ -2217,11 +2245,9 @@ async def process_chat_message(message: types.Message):
             is_link_allowed = (user_id in free_links)
 
             if not is_link_allowed:
-                # Fast check for Admin/Owner exemptions
-                if await is_user_admin(chat_id, user_id, message):
-                    if await is_owner_or_anonymous_admin(chat_id, user_id, message):
-                        is_link_allowed = True
-                    elif group_config.get("ignore_admins", False):
+                # Admins and Owner are exempt from in-chat link filter ONLY if ignore_admins is True
+                if group_config.get("ignore_admins", False):
+                    if await is_user_admin(chat_id, user_id, message):
                         is_link_allowed = True
 
             if not is_link_allowed:

@@ -202,6 +202,67 @@ class TestChatLinkDetection(unittest.TestCase):
         self.assertTrue(has_link)
         self.assertIn("Forwarded", reason)
 
+    def test_forwarded_from_channel(self):
+        msg = types.Message.de_json({
+            "message_id": 201,
+            "from": {"id": 102, "is_bot": False, "first_name": "Member"},
+            "date": int(time.time()),
+            "chat": {"id": -1001, "type": "supergroup"},
+            "text": "Post from channel",
+            "forward_date": int(time.time()) - 100,
+            "forward_from_chat": {"id": -1009999, "type": "channel", "title": "Spam Channel"}
+        })
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertIn("Forwarded", reason)
+
+    def test_forwarded_from_hidden_sender_name(self):
+        msg = types.Message.de_json({
+            "message_id": 202,
+            "from": {"id": 102, "is_bot": False, "first_name": "Member"},
+            "date": int(time.time()),
+            "chat": {"id": -1001, "type": "supergroup"},
+            "text": "Forwarded from hidden privacy user",
+            "forward_date": int(time.time()) - 50,
+            "forward_sender_name": "Lily 💜 (Hermione Granger)"
+        })
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertIn("Forwarded", reason)
+
+    def test_forwarded_media_photo(self):
+        msg = types.Message.de_json({
+            "message_id": 203,
+            "from": {"id": 102, "is_bot": False, "first_name": "Member"},
+            "date": int(time.time()),
+            "chat": {"id": -1001, "type": "supergroup"},
+            "caption": "Check this forwarded photo",
+            "photo": [{"file_id": "xyz", "file_unique_id": "unique_123", "width": 100, "height": 100}],
+            "forward_date": int(time.time()) - 20,
+            "forward_from": {"id": 555, "is_bot": False, "first_name": "OriginUser"}
+        })
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertIn("Forwarded", reason)
+
+    def test_forwarded_origin_channel(self):
+        msg = types.Message.de_json({
+            "message_id": 204,
+            "from": {"id": 102, "is_bot": False, "first_name": "Member"},
+            "date": int(time.time()),
+            "chat": {"id": -1001, "type": "supergroup"},
+            "text": "Check modern channel origin forward",
+            "forward_origin": {
+                "type": "channel",
+                "chat": {"id": -100112233, "type": "channel", "title": "Adult Channel"},
+                "date": int(time.time()) - 30,
+                "message_id": 4455
+            }
+        })
+        has_link, reason = detect_chat_link(msg)
+        self.assertTrue(has_link)
+        self.assertIn("Forwarded", reason)
+
     def test_url_entity(self):
         msg = types.Message(
             message_id=3,
@@ -588,6 +649,95 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
             mock_send.return_value = types.Message.de_json({"message_id": 888, "date": int(time.time()), "chat": {"id": chat_id, "type": "supergroup"}})
             await process_chat_message(msg)
             self.assertTrue(mock_del.called)
+
+    async def test_owner_table_link_deleted_when_filter_on(self):
+        from unittest.mock import AsyncMock, patch
+        chat_id = -100445566
+        owner_id = 123456789
+        config = get_group_config(chat_id)
+        config["filter_links"] = True
+        config["ignore_admins"] = False  # Filter ON
+
+        json_data = {
+            "message_id": 9999,
+            "from": {"id": owner_id, "is_bot": False, "first_name": "..DKT.. :("},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "forward_date": int(time.time()) - 10,
+            "forward_sender_name": "Lily 💜 (Hermione Granger)",
+            "text": "NGẮM GÁI XINH 2026 ARCHIVE XxX GÁI XINH NGẮM\n\nTap to Access Full Collection ⤵️",
+            "reply_markup": {
+                "inline_keyboard": [
+                    [{"text": "😊 LIVE CAMS 24/7", "url": "https://t.me/cam"}],
+                    [{"text": "💥 🪽 TAP HERE 🪽 💥 ↗️", "url": "https://t.me/tap"}]
+                ]
+            }
+        }
+        msg = types.Message.de_json(json_data)
+        admin_cache[chat_id] = ({owner_id}, owner_id, time.monotonic() + 300)
+
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del:
+            await process_chat_message(msg)
+            self.assertTrue(mock_del.called, "Owner's table link spam message MUST be deleted on Priority 1 when Admins: Filter ON")
+
+    async def test_bio_violation_cache_ttl_allows_quick_unblock(self):
+        from unittest.mock import AsyncMock, patch
+        chat_id = -100556677
+        user_id = 99887766
+        config = get_group_config(chat_id)
+        config["ignore_admins"] = False
+        config["action"] = "delete"
+
+        # 1. User initially has link in bio
+        bad_chat = types.Chat.de_json({
+            "id": user_id,
+            "type": "private",
+            "bio": "Check out t.me/spam_link"
+        })
+        clean_chat = types.Chat.de_json({
+            "id": user_id,
+            "type": "private",
+            "bio": "Clean bio now with no link"
+        })
+
+        msg1 = types.Message.de_json({
+            "message_id": 1001,
+            "from": {"id": user_id, "is_bot": False, "first_name": "SpamUser"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "First bad msg"
+        })
+        msg2 = types.Message.de_json({
+            "message_id": 1002,
+            "from": {"id": user_id, "is_bot": False, "first_name": "SpamUser"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()) + 3,
+            "text": "Second clean msg after link removal"
+        })
+
+        bio_cache.clear()
+        admin_cache[chat_id] = (set(), 1, time.monotonic() + 300)
+
+        with patch.object(bot, "get_chat", new=AsyncMock(return_value=bad_chat)), \
+             patch.object(bot, "delete_message", new=AsyncMock()) as mock_del, \
+             patch.object(bot, "send_message", new=AsyncMock()):
+            await process_chat_message(msg1)
+            self.assertTrue(mock_del.called)
+
+        # Violation cache is only 2.0s, so after expiry, next scan fetches clean profile
+        user_cache_entry = bio_cache.get(user_id)
+        self.assertIsNotNone(user_cache_entry)
+        has_v, reason, exp = user_cache_entry
+        self.assertTrue(has_v)
+        # Simulate time passing by 2.1 seconds
+        bio_cache[user_id] = (has_v, reason, time.monotonic() - 0.1)
+
+        with patch.object(bot, "get_chat", new=AsyncMock(return_value=clean_chat)), \
+             patch.object(bot, "delete_message", new=AsyncMock()) as mock_del2, \
+             patch.object(bot, "send_message", new=AsyncMock()):
+            await process_chat_message(msg2)
+            # Message 2 should NOT be deleted because user removed link from bio!
+            self.assertFalse(mock_del2.called, "Clean user must NOT be deleted after removing bio link")
 
 if __name__ == "__main__":
     unittest.main()
