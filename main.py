@@ -453,7 +453,8 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
             logger.warning(f"Telegram FloodWait encountered for user {user_id}. Backing off for {retry_after}s.")
             bio_cache[user_id] = (False, "", now + float(retry_after))
         else:
-            bio_cache[user_id] = (False, "", now + 60.0)
+            logger.warning(f"Could not retrieve bio for user {user_id}: {e} (code: {err_code})")
+            bio_cache[user_id] = (False, "", now + 5.0)
         return False, ""
     except Exception as e:
         if not future.done():
@@ -620,8 +621,9 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
     # Step 1: Always delete the violating message
     try:
         await bot.delete_message(chat_id, message.message_id)
+        logger.info(f"Successfully deleted violating message {message.message_id} from user {user.id} in {chat_id}")
     except TELEGRAM_EXCEPTIONS as e:
-        logger.warning(f"Could not delete message {message.message_id} in chat {chat_id}: {e}")
+        logger.error(f"FAILED to delete message {message.message_id} in {chat_id}: {e}. Ensure the bot is an Admin with 'Delete Messages' permission!")
 
     # Record to MongoDB audit trail asynchronously
     if db_manager.is_connected:
