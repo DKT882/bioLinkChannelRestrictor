@@ -497,7 +497,8 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Bio & Channel", grid_buttons)
         self.assertIn("In-Chat Links", grid_buttons)
         self.assertIn("Action:", grid_buttons)
-        self.assertIn("Admins:", grid_buttons)
+        self.assertIn("Admin Links:", grid_buttons)
+        self.assertIn("Admin Bio:", grid_buttons)
         self.assertIn("Bio Exempt", grid_buttons)
         self.assertIn("Link Allowed", grid_buttons)
         self.assertIn("Notice:", grid_buttons)
@@ -511,7 +512,7 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         config = get_group_config(chat_id)
         config["title"] = "Crypto Elite"
 
-        for sub_type in ["bio", "links", "free", "freel", "notice", "delmsg", "promo", "apprv"]:
+        for sub_type in ["bio", "links", "admlinks", "free", "freel", "notice", "delmsg", "promo", "apprv"]:
             sub_text, sub_kb = render_sub_setting(chat_id, sub_type)
             self.assertIn("Crypto Elite", sub_text)
             self.assertIn("Back to Settings", str(sub_kb.to_dict()))
@@ -781,6 +782,76 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
             with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del:
                 await process_chat_message(msg)
                 self.assertTrue(mock_del.called, f"Forwarded message sent by {role_name} MUST be deleted with zero exemption!")
+
+    async def test_admin_and_anonymous_admin_link_deletion(self):
+        """
+        Verifies that links from regular admins AND anonymous admins are deleted
+        when filter_admin_links is True (default).
+        When filter_admin_links is False or user is in free_links, they are allowed.
+        """
+        from unittest.mock import AsyncMock, patch
+        chat_id = -100889900
+        admin_id = 778899
+        config = get_group_config(chat_id)
+        config["filter_links"] = True
+        config["filter_admin_links"] = True
+
+        admin_cache[chat_id] = ({admin_id}, admin_id, time.monotonic() + 300)
+
+        # 1. Regular admin sends a link
+        msg_admin = types.Message.de_json({
+            "message_id": 501,
+            "from": {"id": admin_id, "is_bot": False, "first_name": "AdminDave"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "Join our channel https://t.me/newchannel"
+        })
+
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del:
+            await process_chat_message(msg_admin)
+            self.assertTrue(mock_del.called, "Regular admin link must be deleted when filter_admin_links=True")
+
+        # 2. Anonymous admin sends a link
+        msg_anon = types.Message.de_json({
+            "message_id": 502,
+            "from": {"id": 1087968824, "is_bot": False, "first_name": "GroupAnonymousBot"},
+            "sender_chat": {"id": chat_id, "type": "supergroup", "title": "Supergroup"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "Visit https://google.com for info"
+        })
+
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del_anon:
+            await process_chat_message(msg_anon)
+            self.assertTrue(mock_del_anon.called, "Anonymous admin link must be deleted when filter_admin_links=True")
+
+        # 3. Clean admin message with no link is NOT deleted
+        msg_clean = types.Message.de_json({
+            "message_id": 503,
+            "from": {"id": admin_id, "is_bot": False, "first_name": "AdminDave"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "Meeting will start in 10 minutes"
+        })
+
+        mock_clean_chat = types.Chat.de_json({"id": admin_id, "type": "private", "bio": "Clean admin bio"})
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del_clean, \
+             patch.object(bot, "get_chat", new=AsyncMock(return_value=mock_clean_chat)):
+            await process_chat_message(msg_clean)
+            self.assertFalse(mock_del_clean.called, "Clean admin message must NOT be deleted")
+
+        # 4. When filter_admin_links is False, admin link is allowed
+        config["filter_admin_links"] = False
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del_allowed:
+            await process_chat_message(msg_admin)
+            self.assertFalse(mock_del_allowed.called, "Admin link must be allowed when filter_admin_links=False")
+
+        # 5. When admin is in free_links, link is allowed even if filter_admin_links is True
+        config["filter_admin_links"] = True
+        config["free_links"] = {admin_id}
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del_freelink:
+            await process_chat_message(msg_admin)
+            self.assertFalse(mock_del_freelink.called, "Whitelisted admin in free_links must be allowed")
 
 if __name__ == "__main__":
     unittest.main()

@@ -149,7 +149,9 @@ def load_settings() -> Dict[int, Dict[str, Any]]:
                         "title": cfg.get("title", ""),
                         "filter_links": cfg.get("filter_links", True),
                         "filter_bio": cfg.get("filter_bio", True),
-                "send_bio_notice": cfg.get("send_bio_notice", True)
+                        "filter_admin_links": cfg.get("filter_admin_links", not cfg.get("ignore_admins", False)),
+                        "filter_admin_bio": cfg.get("filter_admin_bio", not cfg.get("ignore_admins", False)),
+                        "send_bio_notice": cfg.get("send_bio_notice", True)
                     }
             logger.info(f"Loaded persistent configurations for {len(groups)} group(s).")
         except Exception as e:
@@ -174,6 +176,8 @@ def save_settings():
                 "title": cfg.get("title", ""),
                 "filter_links": cfg.get("filter_links", True),
                 "filter_bio": cfg.get("filter_bio", True),
+                "filter_admin_links": cfg.get("filter_admin_links", True),
+                "filter_admin_bio": cfg.get("filter_admin_bio", True),
                 "send_bio_notice": cfg.get("send_bio_notice", True)
             }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
@@ -205,6 +209,8 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
             "title": "",
             "filter_links": True,
             "filter_bio": True,
+            "filter_admin_links": True,
+            "filter_admin_bio": True,
             "send_bio_notice": True
         }
         save_settings()
@@ -232,6 +238,10 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
         cfg["filter_bio"] = True
     if "send_bio_notice" not in cfg:
         cfg["send_bio_notice"] = True
+    if "filter_admin_links" not in cfg:
+        cfg["filter_admin_links"] = not cfg.get("ignore_admins", False)
+    if "filter_admin_bio" not in cfg:
+        cfg["filter_admin_bio"] = not cfg.get("ignore_admins", False)
     return cfg
 
 # ------------------------------------------------------------------------------
@@ -951,56 +961,64 @@ def render_group_settings_grid(chat_id: int) -> Tuple[str, types.InlineKeyboardM
     title = config.get("title") or f"Group {chat_id}"
     action = config.get("action", "delete")
     ignore_admins = config.get("ignore_admins", False)
+    filter_bio = config.get("filter_bio", True)
+    filter_links = config.get("filter_links", True)
+    filter_admin_links = config.get("filter_admin_links", not ignore_admins)
+    filter_admin_bio = config.get("filter_admin_bio", not ignore_admins)
     bio_exempt_count = len(config.get("free_list", set()))
     link_count = len(config.get("free_links", set()))
 
     text = (
         "<b>SETTINGS</b>\n"
         f"<b>Group:</b> {html.escape(title)}\n\n"
-        "<i>Select one of the settings that you want to change.</i>"
+        f"• <b>In-Chat Links:</b> {'Active ✅ (Blocked)' if filter_links else 'Disabled ❌ (Allowed)'}\n"
+        f"• <b>Admin Links:</b> {'🚫 DELETED (Admins cannot send links)' if filter_admin_links else '✅ ALLOWED (Admins exempt)'}\n"
+        f"• <b>Bio & Channels:</b> {'Active ✅ (Blocked)' if filter_bio else 'Disabled ❌ (Allowed)'}\n"
+        f"• <b>Admin Bio:</b> {'🚫 SCANNED & DELETED' if filter_admin_bio else '✅ EXEMPT'}\n"
+        f"• <b>Violation Action:</b> <code>{action}</code>\n\n"
+        "<i>Select one of the settings that you want to change:</i>"
     )
 
     markup = types.InlineKeyboardMarkup(row_width=2)
 
     # Row 1: Bio & Channel restriction toggle | In-Chat Links restriction toggle
-    filter_bio = config.get("filter_bio", True)
-    filter_links = config.get("filter_links", True)
     bio_label = "📜 Bio & Channel: ON" if filter_bio else "📜 Bio & Channel: OFF"
     links_label = "📨 In-Chat Links: ON" if filter_links else "📨 In-Chat Links: OFF"
-
     btn_bio = types.InlineKeyboardButton(bio_label, callback_data=f"toggle_bio_{chat_id}")
     btn_chat_links = types.InlineKeyboardButton(links_label, callback_data=f"toggle_links_{chat_id}")
     markup.row(btn_bio, btn_chat_links)
 
-    # Row 2: Punishment action cycler | Admin filter toggle
+    # Row 2: Admin Links Toggle | Admin Bio Toggle
+    admlink_label = "👮 Admin Links: ❌ Blocked" if filter_admin_links else "👮 Admin Links: ✅ Allowed"
+    admbio_label = "🛡️ Admin Bio: ❌ Filter ON" if filter_admin_bio else "🛡️ Admin Bio: ✅ Exempt"
+    btn_admlink = types.InlineKeyboardButton(admlink_label, callback_data=f"toggle_admlink_{chat_id}")
+    btn_admbio = types.InlineKeyboardButton(admbio_label, callback_data=f"toggle_admbio_{chat_id}")
+    markup.row(btn_admlink, btn_admbio)
+
+    # Row 3: Punishment action cycler | Deletion Notice Toggle
     action_label = "Warn (3x➔1d)" if action == "warn" else action.capitalize()
     btn_action = types.InlineKeyboardButton(f"⚖️ Action: {action_label}", callback_data=f"cycle_act_{chat_id}")
-    admin_label = "🛡️ Admins: Filter ON" if not ignore_admins else "🛡️ Admins: Exempt"
-    btn_admins = types.InlineKeyboardButton(admin_label, callback_data=f"toggle_adm_{chat_id}")
-    markup.row(btn_action, btn_admins)
+    send_notice = config.get("send_bio_notice", True)
+    notice_label = f"📢 Notice: {'ON ✅' if send_notice else 'OFF ❌'}"
+    btn_notice_toggle = types.InlineKeyboardButton(notice_label, callback_data=f"toggle_notice_{chat_id}")
+    markup.row(btn_action, btn_notice_toggle)
 
-    # Row 3: Bio Exempt count | Link Allowed count
+    # Row 4: Bio Exempt count | Link Allowed count
     btn_free = types.InlineKeyboardButton(f"👥 Bio Exempt ({bio_exempt_count})", callback_data=f"sub_free_{chat_id}")
     btn_free_links = types.InlineKeyboardButton(f"🔗 Link Allowed ({link_count})", callback_data=f"sub_freel_{chat_id}")
     markup.row(btn_free, btn_free_links)
 
-    # Row 4: Deletion Notice Toggle & Custom Edit
-    send_notice = config.get("send_bio_notice", True)
-    notice_label = f"📢 Notice: {'ON ✅' if send_notice else 'OFF ❌'}"
-    btn_notice_toggle = types.InlineKeyboardButton(notice_label, callback_data=f"toggle_notice_{chat_id}")
+    # Row 5: Notice Custom Edit | Deleting Messages info
     btn_notice_edit = types.InlineKeyboardButton("✏️ Edit Notice", callback_data=f"sub_notice_{chat_id}")
-    markup.row(btn_notice_toggle, btn_notice_edit)
-
-    # Row 5: Deleting Messages info | Anti-Promotion
     btn_delmsg = types.InlineKeyboardButton("🗑 Deleting Messages", callback_data=f"sub_delmsg_{chat_id}")
+    markup.row(btn_notice_edit, btn_delmsg)
+
+    # Row 6: Anti-Promotion info | Approval Mode info
     btn_antipromo = types.InlineKeyboardButton("🕵️‍♂️ Anti-Promotion", callback_data=f"sub_promo_{chat_id}")
-    markup.row(btn_delmsg, btn_antipromo)
-
-    # Row 6: Approval Mode
     btn_support = types.InlineKeyboardButton("🎛 Approval Mode", callback_data=f"sub_apprv_{chat_id}")
-    markup.row(btn_support)
+    markup.row(btn_antipromo, btn_support)
 
-    # Bottom Row: Back | Close | Reload (matching Images 1 & 4 bottom bar)
+    # Bottom Row: Back | Close | Reload
     btn_back = types.InlineKeyboardButton("⬅️ Back", callback_data="mng_groups")
     btn_close = types.InlineKeyboardButton("✅ Close", callback_data="close_pvt")
     btn_reload = types.InlineKeyboardButton("🔄 Reload", callback_data=f"grp_{chat_id}")
@@ -1035,18 +1053,38 @@ def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.InlineKe
         markup.add(types.InlineKeyboardButton(toggle_btn_text, callback_data=f"toggle_bio_{chat_id}"))
     elif sub_type == "links":
         filter_links = config.get("filter_links", True)
+        filter_admin_links = config.get("filter_admin_links", not config.get("ignore_admins", False))
         status_str = "Active ✅ (Default)" if filter_links else "Disabled ❌ (Off)"
+        admlink_str = "🚫 Blocked (Admin links deleted)" if filter_admin_links else "✅ Allowed (Admins exempt)"
         action_str = "Silently deleted immediately with ZERO spam notification." if filter_links else "Disabled (All group members are allowed to send links)."
         text = (
             f"📨 <b>In-Chat Links & Forwards Filter</b>\n"
             f"<b>Group:</b> {html.escape(title)}\n\n"
-            f"• <b>Status:</b> <code>{status_str}</code>\n"
+            f"• <b>Filter Status:</b> <code>{status_str}</code>\n"
+            f"• <b>Admin Links:</b> <code>{admlink_str}</code>\n"
             f"• <b>Prohibited Content:</b> Web links, inline links, forwarded messages from {{users, bots, channels, groups}}, and external bot mentions.\n"
             f"• <b>Action:</b> {action_str}\n\n"
-            f"<i>Only users granted permission with /free link or the Group Owner can send links when filter is ON.</i>"
+            f"<i>Use the buttons below to toggle general link filter or admin link restrictions.</i>"
         )
         toggle_btn_text = "🔴 Turn Filter OFF" if filter_links else "🟢 Turn Filter ON"
-        markup.add(types.InlineKeyboardButton(toggle_btn_text, callback_data=f"toggle_links_{chat_id}"))
+        toggle_adm_btn_text = "🟢 Allow Admin Links" if filter_admin_links else "🔴 Block Admin Links"
+        markup.add(
+            types.InlineKeyboardButton(toggle_btn_text, callback_data=f"toggle_links_{chat_id}"),
+            types.InlineKeyboardButton(toggle_adm_btn_text, callback_data=f"toggle_admlink_{chat_id}")
+        )
+    elif sub_type == "admlinks":
+        filter_admin_links = config.get("filter_admin_links", not config.get("ignore_admins", False))
+        status_str = "🚫 Blocked & Deleted" if filter_admin_links else "✅ Allowed (Exempt)"
+        text = (
+            f"👮 <b>Admin Link Restrictions</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"• <b>Status:</b> <code>{status_str}</code>\n"
+            f"• <b>Scope:</b> Applies to all Group Administrators, Group Owner, and Anonymous Admins.\n"
+            f"• <b>Action:</b> When Blocked, any messages containing promotional links or button matrices sent by admins are deleted immediately on sight.\n\n"
+            f"<i>Admins can only send links if this setting is Allowed, or if whitelisted via <code>/free link &lt;user&gt;</code>.</i>"
+        )
+        toggle_label = "🟢 Allow Admin Links" if filter_admin_links else "🔴 Block & Delete Admin Links"
+        markup.add(types.InlineKeyboardButton(toggle_label, callback_data=f"toggle_admlink_{chat_id}"))
     elif sub_type == "free":
         free_list = config.get("free_list", set())
         users_str = ", ".join(f"<code>{uid}</code>" for uid in list(free_list)[:15]) or "<i>None</i>"
@@ -1269,7 +1307,82 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
             await bot.answer_callback_query(call.id, "Could not update action.")
         return
 
-    # 8. Admin Filter Toggle Button
+    # 8a. Toggle Admin Links (Block vs Allow)
+    if data.startswith("toggle_admlink_"):
+        try:
+            chat_id = int(data.split("_")[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            config = get_group_config(chat_id)
+            current_state = config.get("filter_admin_links", not config.get("ignore_admins", False))
+            new_state = not current_state
+            config["filter_admin_links"] = new_state
+            if not new_state and not config.get("filter_admin_bio", True):
+                config["ignore_admins"] = True
+            elif new_state:
+                config["ignore_admins"] = False
+            save_settings()
+            admin_cache.pop(chat_id, None)
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.upsert_group(
+                    chat_id=chat_id,
+                    filter_admin_links=new_state,
+                    ignore_admins=config.get("ignore_admins", False)
+                ))
+
+            msg_text = call.message.text or ""
+            if "Admin Link" in msg_text:
+                text, markup = render_sub_setting(chat_id, "admlinks")
+            elif "In-Chat Links" in msg_text:
+                text, markup = render_sub_setting(chat_id, "links")
+            else:
+                text, markup = render_group_settings_grid(chat_id)
+
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            notice = "🚫 Admin Links will be DELETED" if new_state else "✅ Admins are ALLOWED to send links"
+            await bot.answer_callback_query(call.id, notice)
+        except Exception as e:
+            logger.error(f"Error toggling admin link filter: {e}")
+            await bot.answer_callback_query(call.id, "Could not toggle admin link setting.")
+        return
+
+    # 8b. Toggle Admin Bio (Filter ON vs Exempt)
+    if data.startswith("toggle_admbio_"):
+        try:
+            chat_id = int(data.split("_")[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            config = get_group_config(chat_id)
+            current_state = config.get("filter_admin_bio", not config.get("ignore_admins", False))
+            new_state = not current_state
+            config["filter_admin_bio"] = new_state
+            if not new_state and not config.get("filter_admin_links", True):
+                config["ignore_admins"] = True
+            elif new_state:
+                config["ignore_admins"] = False
+            save_settings()
+            admin_cache.pop(chat_id, None)
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.upsert_group(
+                    chat_id=chat_id,
+                    filter_admin_bio=new_state,
+                    ignore_admins=config.get("ignore_admins", False)
+                ))
+
+            text, markup = render_group_settings_grid(chat_id)
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            notice = "🚫 Admin Bio will be SCANNED and deleted" if new_state else "✅ Admins EXEMPT from bio scans"
+            await bot.answer_callback_query(call.id, notice)
+        except Exception as e:
+            logger.error(f"Error toggling admin bio filter: {e}")
+            await bot.answer_callback_query(call.id, "Could not toggle admin bio setting.")
+        return
+
+    # 8c. Legacy Admin Filter Toggle Button (toggles both)
     if data.startswith("toggle_adm_"):
         try:
             chat_id = int(data.split("_")[2])
@@ -1278,16 +1391,23 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
                 return
 
             config = get_group_config(chat_id)
-            new_state = not config.get("ignore_admins", False)
-            config["ignore_admins"] = new_state
+            new_ignore = not config.get("ignore_admins", False)
+            config["ignore_admins"] = new_ignore
+            config["filter_admin_links"] = not new_ignore
+            config["filter_admin_bio"] = not new_ignore
             save_settings()
             admin_cache.pop(chat_id, None)
             if db_manager.is_connected:
-                asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, ignore_admins=new_state))
+                asyncio.create_task(db_manager.upsert_group(
+                    chat_id=chat_id,
+                    ignore_admins=new_ignore,
+                    filter_admin_links=not new_ignore,
+                    filter_admin_bio=not new_ignore
+                ))
 
             text, markup = render_group_settings_grid(chat_id)
             await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
-            notice = "Admins will be EXEMPT" if new_state else "Admins will be SCANNED and deleted"
+            notice = "Admins will be EXEMPT" if new_ignore else "Admins will be SCANNED and deleted"
             await bot.answer_callback_query(call.id, notice)
         except Exception as e:
             logger.error(f"Error toggling admin filter: {e}")
@@ -2318,8 +2438,6 @@ async def process_chat_message(message: types.Message):
         (message.sender_chat and message.sender_chat.id == chat_id) or
         (message.from_user and message.from_user.id == ANONYMOUS_ADMIN_USER_ID)
     )
-    if is_anon_admin:
-        return
 
     # Sender ID resolution (handles regular user, external channel, or bot)
     user_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else 0)
@@ -2341,16 +2459,23 @@ async def process_chat_message(message: types.Message):
                 is_link_allowed = (user_id in free_links)
 
                 if not is_link_allowed:
-                    # Admins and Owner are exempt from standard in-chat link filter ONLY if ignore_admins is True
-                    if group_config.get("ignore_admins", False):
-                        if await is_user_admin(chat_id, user_id, message):
+                    # Check if admin link filter is active (Default: True -> Admin links are DELETED!)
+                    filter_admin_links = group_config.get("filter_admin_links", not group_config.get("ignore_admins", False))
+
+                    if not filter_admin_links:
+                        # Admin link filter is OFF: Admins and Owner are exempt
+                        if is_anon_admin or await is_user_admin(chat_id, user_id, message):
                             is_link_allowed = True
+                    else:
+                        # Admin link filter is ON: Admins, Owner, and Anonymous Admins CANNOT send links!
+                        is_link_allowed = False
 
             if not is_link_allowed:
                 # INSTANT PRIORITY DELETION:
                 # Dispatched immediately before any database or background tasks
                 try:
                     await bot.delete_message(chat_id, message.message_id)
+                    logger.info(f"[BioRestrictor] Successfully deleted link message {message.message_id} in {chat_id} (Reason: {link_reason})")
                 except TELEGRAM_EXCEPTIONS as e:
                     logger.warning(f"Could not delete restricted link message {message.message_id} in {chat_id}: {e}")
 
@@ -2358,18 +2483,25 @@ async def process_chat_message(message: types.Message):
                     msg_content = message.text or message.caption or ""
                     u_name = message.from_user.username if message.from_user else ""
                     f_name = message.from_user.first_name if message.from_user else (message.sender_chat.title if message.sender_chat else "")
+                    is_adm = await is_user_admin(chat_id, user_id, message) if user_id else is_anon_admin
                     asyncio.create_task(db_manager.log_moderation_event(
                         chat_id=chat_id,
                         user_id=user_id,
                         username=u_name or "",
                         first_name=f_name or "",
-                        is_admin=False,
+                        is_admin=is_adm,
                         violation_type="chat_link",
                         violation_detail=link_reason,
                         action_taken="delete",
                         message_text=msg_content
                     ))
                 return
+
+    # Check for Anonymous Admin (posted as chat channel or via AnonymousBot)
+    # They have already passed Check 0 (forwards) and Check 1 (links).
+    # Since anonymous admins have no personal user profile/bio, we skip Check 2.
+    if is_anon_admin:
+        return
 
     # Dynamic username tracking (for /free lookup)
     if message.from_user and message.from_user.username:
@@ -2391,8 +2523,9 @@ async def process_chat_message(message: types.Message):
         if user_id in free_list:
             return
 
-        # Fast Check 2b: Skip admins & owner ONLY IF ignore_admins is True (Default: False / Admins & Owner are scanned)
-        if group_config.get("ignore_admins", False):
+        # Fast Check 2b: Skip admins & owner ONLY IF filter_admin_bio is False
+        filter_admin_bio = group_config.get("filter_admin_bio", not group_config.get("ignore_admins", False))
+        if not filter_admin_bio:
             if await is_user_admin(chat_id, user_id, message):
                 return
 
