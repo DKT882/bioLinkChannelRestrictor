@@ -88,6 +88,20 @@ BIO_LINK_REGEX = re.compile(
     re.IGNORECASE
 )
 
+# Specific regex for in-chat URL, domain, and invite detection (excludes @mentions which are checked separately)
+CHAT_LINK_ONLY_REGEX = re.compile(
+    r'(?:'
+    r'https?://\S+'
+    r'|www\.\S+'
+    r'|t\.me/\S+'
+    r'|telegram\.me/\S+'
+    r'|telegram\.dog/\S+'
+    r'|tg://\S+'
+    r'|\b[a-zA-Z0-9.-]+\.(?:com|org|net|edu|gov|io|me|co|info|xyz|app|dev|ai|cc|top|club|site|online|vip|pro|link|bio|ly|ee|to|gg|is|tech|ru|in|de|uk|ca|fr|br|nl|tv|cx|ws|porn|xxx|sex|adult|cam|live|click|beauty|shop|store|world|today|fun|cloud|monster|space|press|rest|lat|fit|hair|bot)\b(?:/\S*)?'
+    r')',
+    re.IGNORECASE
+)
+
 # Supported media & message types to intercept
 ALL_CONTENT_TYPES = telebot.util.content_type_media + telebot.util.content_type_service
 
@@ -154,7 +168,8 @@ def load_settings() -> Dict[int, Dict[str, Any]]:
                         "filter_bio": cfg.get("filter_bio", True),
                         "filter_admin_links": cfg.get("filter_admin_links", not cfg.get("ignore_admins", False)),
                         "filter_admin_bio": cfg.get("filter_admin_bio", not cfg.get("ignore_admins", False)),
-                        "send_bio_notice": cfg.get("send_bio_notice", True)
+                        "send_bio_notice": cfg.get("send_bio_notice", True),
+                        "only_admin_mentions": cfg.get("only_admin_mentions", True)
                     }
             logger.info(f"Loaded persistent configurations for {len(groups)} group(s).")
         except Exception as e:
@@ -181,7 +196,8 @@ def save_settings():
                 "filter_bio": cfg.get("filter_bio", True),
                 "filter_admin_links": cfg.get("filter_admin_links", True),
                 "filter_admin_bio": cfg.get("filter_admin_bio", True),
-                "send_bio_notice": cfg.get("send_bio_notice", True)
+                "send_bio_notice": cfg.get("send_bio_notice", True),
+                "only_admin_mentions": cfg.get("only_admin_mentions", True)
             }
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -214,7 +230,8 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
             "filter_bio": True,
             "filter_admin_links": True,
             "filter_admin_bio": True,
-            "send_bio_notice": True
+            "send_bio_notice": True,
+            "only_admin_mentions": True
         }
         save_settings()
         if db_manager.is_connected:
@@ -329,6 +346,10 @@ async def is_user_admin(chat_id: int, user_id: int, message: Optional[types.Mess
         except Exception:
             pass
 
+    # Safe fallback if offline or in disconnected test environment
+    if not bot_metadata.get("connected", False):
+        return False
+
     loop = asyncio.get_running_loop()
     future = loop.create_future()
     in_flight_admin_scans[chat_id] = future
@@ -337,7 +358,15 @@ async def is_user_admin(chat_id: int, user_id: int, message: Optional[types.Mess
         admins = await bot.get_chat_administrators(chat_id)
         admin_ids = {a.user.id for a in admins if a.user}
         owner_id = next((a.user.id for a in admins if a.user and a.status == "creator"), None)
-        admin_cache[chat_id] = (admin_ids, owner_id, now + ADMIN_CACHE_TTL)
+        admin_unames = {a.user.username.lower() for a in admins if a.user and a.user.username}
+        for a in admins:
+            if a.user:
+                u = a.user
+                u_name = (u.first_name or "") + (f" {u.last_name}" if getattr(u, 'last_name', None) else "")
+                user_info_cache[u.id] = {"name": u_name, "username": u.username or ""}
+                if u.username:
+                    username_to_id[u.username.lower()] = u.id
+        admin_cache[chat_id] = (admin_ids, owner_id, admin_unames, now + ADMIN_CACHE_TTL)
         if not future.done():
             future.set_result((admin_ids, owner_id))
         return user_id in admin_ids
@@ -393,11 +422,14 @@ async def is_owner_or_anonymous_admin(chat_id: int, user_id: int, message: Optio
     if chat_id in admin_cache:
         entry = admin_cache[chat_id]
         cached_admins = entry[0]
-        owner_id = entry[1] if len(entry) == 3 else None
+        owner_id = entry[1] if len(entry) >= 2 and isinstance(entry[1], int) else None
         if user_id not in cached_admins:
             return False
         if owner_id is not None:
             return user_id == owner_id
+
+    if not bot_metadata.get("connected", False):
+        return False
 
     try:
         member = await bot.get_chat_member(chat_id, user_id)
@@ -533,6 +565,47 @@ def format_bio_delete_notice(template: Optional[str], user: types.User) -> str:
     return formatted
 
 
+async def get_chat_admin_sets(chat_id: int) -> Tuple[Set[int], Set[str]]:
+    """
+    Returns (set_of_admin_user_ids, set_of_admin_lowercase_usernames).
+    Utilizes admin_cache for sub-microsecond in-memory retrieval.
+    """
+    now = time.monotonic()
+    if chat_id in admin_cache:
+        entry = admin_cache[chat_id]
+        if now < entry[-1]:
+            admin_ids = entry[0]
+            admin_unames = set()
+            for elem in entry[1:-1]:
+                if isinstance(elem, set):
+                    admin_unames = elem
+                    break
+            return admin_ids, admin_unames
+
+    # Cache miss: if offline or running in test harness without connection, return safely
+    if not bot_metadata.get("connected", False):
+        return set(), set()
+
+    # Cache miss: refresh administrators via API
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        admin_ids = {a.user.id for a in admins if a.user}
+        owner_id = next((a.user.id for a in admins if a.user and a.status == "creator"), None)
+        admin_unames = {a.user.username.lower() for a in admins if a.user and a.user.username}
+        for a in admins:
+            if a.user:
+                u = a.user
+                u_name = (u.first_name or "") + (f" {u.last_name}" if getattr(u, 'last_name', None) else "")
+                user_info_cache[u.id] = {"name": u_name, "username": u.username or ""}
+                if u.username:
+                    username_to_id[u.username.lower()] = u.id
+        admin_cache[chat_id] = (admin_ids, owner_id, admin_unames, now + ADMIN_CACHE_TTL)
+        return admin_ids, admin_unames
+    except Exception as e:
+        logger.warning(f"Could not fetch admin sets for chat {chat_id}: {e}")
+        return set(), set()
+
+
 def schedule_command_cleanup(message: types.Message, delay: int = 3):
     """
     Automatically deletes admin/owner/anonymous command message after a quick delay (e.g. 3s).
@@ -581,14 +654,22 @@ def is_forwarded_message(message: types.Message) -> bool:
     return False
 
 
-def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
+def detect_chat_link(
+    message: types.Message,
+    allowed_admin_unames: Optional[Set[str]] = None,
+    allowed_admin_ids: Optional[Set[int]] = None,
+    allow_all_mentions: bool = False,
+    check_web_links: bool = True
+) -> Tuple[bool, str]:
     """
-    Ultra-fast scanner for all kinds of in-chat links, forwards, mentions,
+    Ultra-fast scanner for all kinds of in-chat links, forwards, unauthorized mentions,
     table links (inline keyboard buttons with URLs/web apps), inline bots,
     multiple links, telegram deep links, markdown/HTML links, and contact info.
+    If allowed_admin_unames is provided, mentions of group admins are ALLOWED,
+    while mentions of non-admins (other members, outside users/channels) are flagged!
     Returns (has_link: bool, reason: str).
     """
-# 0. Extract raw JSON dictionary fallback for complete cross-version compatibility
+    # 0. Extract raw JSON dictionary fallback for complete cross-version compatibility
     raw_json = getattr(message, "json", {})
     if isinstance(raw_json, str):
         try:
@@ -599,12 +680,12 @@ def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
         raw_json = {}
 
     # 1. Forward check (from user, bot, channel, group, hidden sender, signature, or forward_origin)
-    if is_forwarded_message(message):
+    if check_web_links and is_forwarded_message(message):
         return True, "Forwarded message"
 
     # 2. Table Links & Inline Keyboard Buttons
     # Detects button tables/grids containing URLs, web apps, or switch query spam
-    rm = getattr(message, "reply_markup", None)
+    rm = getattr(message, "reply_markup", None) if check_web_links else None
     if rm is None and isinstance(raw_json, dict):
         rm = raw_json.get("reply_markup")
 
@@ -637,54 +718,74 @@ def detect_chat_link(message: types.Message) -> Tuple[bool, str]:
                         return True, "Inline button switch query"
                 return True, "Inline keyboard table button"
 
-
     # 3. Message sent via Inline Bot (@bot query)
-    if getattr(message, "via_bot", None) is not None:
+    if check_web_links and getattr(message, "via_bot", None) is not None:
         bot_user = message.via_bot
         uname = f"@{bot_user.username}" if getattr(bot_user, "username", None) else f"ID:{bot_user.id}"
         return True, f"Message sent via inline bot ({uname})"
 
     # 4. Telegram pre-parsed message entities & caption entities (takes microseconds)
     entities = (message.entities or []) + (message.caption_entities or [])
+    full_text = message.text or message.caption or ""
     if entities:
         for ent in entities:
             e_type = ent.type
-            if e_type in ("url", "text_link"):
+            if check_web_links and e_type in ("url", "text_link"):
                 return True, f"Link entity ({e_type})"
-            if e_type in ("mention", "text_mention"):
-                return True, f"Mention entity ({e_type})"
-            if e_type == "custom_emoji":
+            if e_type == "mention":
+                if allow_all_mentions:
+                    pass
+                elif allowed_admin_unames is not None:
+                    uname = full_text[ent.offset : ent.offset + ent.length].lstrip("@").lower()
+                    if uname not in allowed_admin_unames:
+                        return True, f"Non-admin mention entity (@{uname})"
+                else:
+                    return True, f"Mention entity ({e_type})"
+            if e_type == "text_mention":
+                if allow_all_mentions:
+                    pass
+                elif allowed_admin_ids is not None and getattr(ent, "user", None):
+                    if ent.user.id not in allowed_admin_ids:
+                        return True, f"Non-admin text mention (ID: {ent.user.id})"
+                else:
+                    return True, f"Mention entity ({e_type})"
+            if check_web_links and e_type == "custom_emoji":
                 return True, "Custom emoji link"
-            if e_type in ("phone_number", "email"):
+            if check_web_links and e_type in ("phone_number", "email"):
                 return True, f"Contact link ({e_type})"
-            if e_type == "bot_command":
-                cmd_text = (message.text or message.caption or "")[ent.offset : ent.offset + ent.length]
+            if check_web_links and e_type == "bot_command":
+                cmd_text = full_text[ent.offset : ent.offset + ent.length]
                 if "@" in cmd_text:
                     return True, f"External bot command ({cmd_text})"
 
     # 5. Telegram Link Preview / Web Page Preview
-    if getattr(message, "link_preview_options", None) is not None:
-        lpo = message.link_preview_options
-        if getattr(lpo, "url", None):
-            return True, f"Link preview ({lpo.url})"
-    if getattr(message, "web_page", None) is not None:
-        return True, "Web page preview"
+    if check_web_links:
+        if getattr(message, "link_preview_options", None) is not None:
+            lpo = message.link_preview_options
+            if getattr(lpo, "url", None):
+                return True, f"Link preview ({lpo.url})"
+        if getattr(message, "web_page", None) is not None:
+            return True, "Web page preview"
 
     # 6. Raw text and caption inspection (supports multiple links, deep links, adult/spam TLDs)
-    combined_text = ""
-    if message.text:
-        combined_text += message.text + " "
-    if message.caption:
-        combined_text += message.caption
-
-    if combined_text:
-        if any(ch in combined_text for ch in (".", ":", "/", "@", "[", "<", "t.me", "http", "tg:")):
-            if BIO_LINK_REGEX.search(combined_text):
+    if full_text:
+        if any(ch in full_text for ch in (".", ":", "/", "@", "[", "<", "t.me", "http", "tg:")):
+            if check_web_links and CHAT_LINK_ONLY_REGEX.search(full_text):
                 return True, "URL or handle in message"
-            if CHAT_MARKDOWN_LINK_REGEX.search(combined_text):
+            if check_web_links and CHAT_MARKDOWN_LINK_REGEX.search(full_text):
                 return True, "Markdown link in message"
-            if CHAT_HTML_LINK_REGEX.search(combined_text):
+            if check_web_links and CHAT_HTML_LINK_REGEX.search(full_text):
                 return True, "HTML link in message"
+            if not allow_all_mentions:
+                if allowed_admin_unames is not None:
+                    if "@" in full_text:
+                        for m in re.finditer(r'@([a-zA-Z0-9_]{3,})', full_text):
+                            raw_uname = m.group(1).lower()
+                            if raw_uname not in allowed_admin_unames:
+                                return True, f"Non-admin handle in message (@{raw_uname})"
+                else:
+                    if BIO_LINK_REGEX.search(full_text):
+                        return True, "URL or handle in message"
 
     return False, ""
 
@@ -1013,6 +1114,13 @@ def render_group_settings_grid(chat_id: int) -> Tuple[str, types.InlineKeyboardM
     btn_support = types.InlineKeyboardButton("🎛 Approval Mode", callback_data=f"sub_apprv_{chat_id}")
     markup.row(btn_antipromo, btn_support)
 
+    # Row 7: Mentions: Admins Only Toggle | Mention Rules
+    only_admin_mentions = config.get("only_admin_mentions", True)
+    mention_label = "🏷️ Mentions: Admin Only" if only_admin_mentions else "🏷️ Mentions: Allowed"
+    btn_mention_toggle = types.InlineKeyboardButton(mention_label, callback_data=f"toggle_mention_{chat_id}")
+    btn_mention_info = types.InlineKeyboardButton("ℹ️ Mention Rules", callback_data=f"sub_mention_{chat_id}")
+    markup.row(btn_mention_toggle, btn_mention_info)
+
     # Bottom Row: Back | Close | Reload
     btn_back = types.InlineKeyboardButton("⬅️ Back", callback_data="mng_groups")
     btn_close = types.InlineKeyboardButton("✅ Close", callback_data="close_pvt")
@@ -1224,6 +1332,20 @@ async def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.In
             f"• Detects connected channel profiles and external business intros.\n"
             f"• Instant sub-millisecond RAM matching."
         )
+    elif sub_type in ("mention", "mentions"):
+        only_admin_mentions = config.get("only_admin_mentions", True)
+        status_str = "Admins Only (Default) ✅" if only_admin_mentions else "Anyone Allowed ❌"
+        text = (
+            f"🏷️ <b>Mention Restrictions</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"• <b>Status:</b> <code>{status_str}</code>\n"
+            f"• <b>Rule:</b> Members are ONLY allowed to tag/mention group administrators.\n"
+            f"• <b>Action:</b> Messages tagging regular members, external users, or outside channels are <b>deleted immediately</b>.\n"
+            f"• <b>Admins:</b> Group administrators can mention anyone without restriction.\n\n"
+            f"<i>Use the button below to toggle this restriction ON or OFF.</i>"
+        )
+        toggle_label = "🔴 Allow Anyone to be Mentioned" if only_admin_mentions else "🟢 Enforce Admins Only Mentions"
+        markup.add(types.InlineKeyboardButton(toggle_label, callback_data=f"toggle_mention_{chat_id}"))
     elif sub_type == "apprv":
         text = (
             f"🎛 <b>Approval Mode & Support</b>\n"
@@ -1628,7 +1750,36 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
             await bot.answer_callback_query(call.id, "Could not reset notice.")
         return
 
-    # 9. Sub-setting Views (sub_bio, sub_links, sub_free, sub_freel, sub_notice, sub_delmsg, sub_promo, sub_apprv)
+    # 8f. Toggle Mention Rule (Admin Only vs Anyone Allowed)
+    if data.startswith("toggle_mention_"):
+        try:
+            chat_id = int(data.split("_")[2])
+            if not await is_user_admin(chat_id, user.id):
+                await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
+                return
+
+            config = get_group_config(chat_id)
+            new_state = not config.get("only_admin_mentions", True)
+            config["only_admin_mentions"] = new_state
+            save_settings()
+            if db_manager.is_connected:
+                asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, only_admin_mentions=new_state))
+
+            msg_text = call.message.text or ""
+            if "Mention Restrictions" in msg_text:
+                text, markup = await render_sub_setting(chat_id, "mention")
+            else:
+                text, markup = render_group_settings_grid(chat_id)
+
+            await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
+            notice = "🏷️ Mentions: Admin Only" if new_state else "🏷️ Mentions: Anyone Allowed"
+            await bot.answer_callback_query(call.id, notice)
+        except Exception as e:
+            logger.error(f"Error toggling mention filter: {e}")
+            await bot.answer_callback_query(call.id, "Could not toggle mention setting.")
+        return
+
+    # 9. Sub-setting Views (sub_bio, sub_links, sub_free, sub_freel, sub_notice, sub_delmsg, sub_promo, sub_apprv, sub_mention)
     if data.startswith("sub_"):
         try:
             parts = data.split("_")
@@ -2537,52 +2688,73 @@ async def process_chat_message(message: types.Message):
             username_to_id[user.username.lower()] = user.id
 
     # --------------------------------------------------------------------------
-    # Check 1: In-Chat Link & Table Button Restriction (PRIORITY 1 - INSTANT SCAN)
+    # Check 1: In-Chat Link, Table Button & Mention Restrictions (PRIORITY 1)
     # --------------------------------------------------------------------------
-    if group_config.get("filter_links", True):
-        has_chat_link, link_reason = detect_chat_link(message)
+    filter_links = group_config.get("filter_links", True)
+    only_admin_mentions = group_config.get("only_admin_mentions", True)
+
+    if filter_links or only_admin_mentions:
+        admin_ids, admin_unames = await get_chat_admin_sets(chat_id)
+        is_sender_admin = (is_anon_admin or (user_id in admin_ids) or await is_user_admin(chat_id, user_id, message))
+
+        # Admins can mention anyone; if only_admin_mentions is False, anyone can mention anyone
+        allow_all_mentions = (not only_admin_mentions) or is_sender_admin
+
+        has_chat_link, link_reason = detect_chat_link(
+            message,
+            allowed_admin_unames=admin_unames if only_admin_mentions else None,
+            allowed_admin_ids=admin_ids if only_admin_mentions else None,
+            allow_all_mentions=allow_all_mentions,
+            check_web_links=filter_links
+        )
+
         if has_chat_link:
-            # Inline keyboard buttons (spam button tables) also have ZERO exemption
             is_table_button = "Inline" in link_reason
+            is_mention_violation = (
+                link_reason.startswith("Non-admin") or
+                link_reason.startswith("Mention entity")
+            )
+
             if is_table_button:
                 is_link_allowed = False
+            elif is_mention_violation and is_sender_admin:
+                # Admins can always mention anyone
+                is_link_allowed = True
             else:
                 free_links: Set[int] = group_config.get("free_links", set())
                 is_link_allowed = (user_id in free_links)
 
                 if not is_link_allowed:
-                    # Check if admin link filter is active (Default: True -> Admin links are DELETED!)
-                    filter_admin_links = group_config.get("filter_admin_links", not group_config.get("ignore_admins", False))
-
-                    if not filter_admin_links:
-                        # Admin link filter is OFF: Admins and Owner are exempt
-                        if is_anon_admin or await is_user_admin(chat_id, user_id, message):
-                            is_link_allowed = True
-                    else:
-                        # Admin link filter is ON: Admins, Owner, and Anonymous Admins CANNOT send links!
+                    if is_mention_violation:
+                        # Non-admin members are strictly prohibited from mentioning non-admins!
                         is_link_allowed = False
+                    else:
+                        # Standard web link check
+                        filter_admin_links = group_config.get("filter_admin_links", not group_config.get("ignore_admins", False))
+                        if not filter_admin_links and is_sender_admin:
+                            is_link_allowed = True
+                        else:
+                            is_link_allowed = False
 
             if not is_link_allowed:
-                # INSTANT PRIORITY DELETION:
-                # Dispatched immediately before any database or background tasks
                 try:
                     await bot.delete_message(chat_id, message.message_id)
-                    logger.info(f"[BioRestrictor] Successfully deleted link message {message.message_id} in {chat_id} (Reason: {link_reason})")
+                    logger.info(f"[BioRestrictor] Successfully deleted restricted message {message.message_id} in {chat_id} (Reason: {link_reason})")
                 except TELEGRAM_EXCEPTIONS as e:
-                    logger.warning(f"Could not delete restricted link message {message.message_id} in {chat_id}: {e}")
+                    logger.warning(f"Could not delete restricted message {message.message_id} in {chat_id}: {e}")
 
                 if db_manager.is_connected:
+                    v_type = "unauthorized_mention" if is_mention_violation else "chat_link"
                     msg_content = message.text or message.caption or ""
                     u_name = message.from_user.username if message.from_user else ""
                     f_name = message.from_user.first_name if message.from_user else (message.sender_chat.title if message.sender_chat else "")
-                    is_adm = await is_user_admin(chat_id, user_id, message) if user_id else is_anon_admin
                     asyncio.create_task(db_manager.log_moderation_event(
                         chat_id=chat_id,
                         user_id=user_id,
                         username=u_name or "",
                         first_name=f_name or "",
-                        is_admin=is_adm,
-                        violation_type="chat_link",
+                        is_admin=is_sender_admin,
+                        violation_type=v_type,
                         violation_detail=link_reason,
                         action_taken="delete",
                         message_text=msg_content

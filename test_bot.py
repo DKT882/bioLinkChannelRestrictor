@@ -923,5 +923,118 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("View Bio Exempt Users", str(link_kb.to_dict()))
         self.assertIn("Refresh List", str(link_kb.to_dict()))
 
+    async def test_admin_only_mentions_enforcement(self):
+        """
+        Comprehensive test for Admin-Only Mentions:
+        - Regular members can ONLY tag/mention administrators.
+        - Mentions of regular members, non-admin members, external users, or outside channels are deleted immediately.
+        - Admins can mention anyone without restriction.
+        - When only_admin_mentions is False, members can mention anyone.
+        """
+        from unittest.mock import AsyncMock, patch
+
+        chat_id = -100778899
+        admin_id = 991199
+        admin_uname = "boss_admin"
+        member_id = 882288
+        non_admin_id = 773377
+
+        config = get_group_config(chat_id)
+        config["title"] = "Secure Supergroup"
+        config["filter_links"] = True
+        config["only_admin_mentions"] = True
+        config["filter_bio"] = True
+        config["filter_admin_links"] = True
+        config["filter_admin_bio"] = False
+
+        admin_cache[chat_id] = ({admin_id}, admin_id, {admin_uname.lower()}, time.monotonic() + 300)
+
+        # 1. Regular member mentions an admin (@boss_admin) -> ALLOWED
+        msg_tag_admin = types.Message.de_json({
+            "message_id": 601,
+            "from": {"id": member_id, "is_bot": False, "first_name": "MemberBob"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "Hello @boss_admin please check this issue"
+        })
+        mock_clean_chat = types.Chat.de_json({"id": member_id, "type": "private", "bio": "Clean member bio"})
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del,              patch.object(bot, "get_chat", new=AsyncMock(return_value=mock_clean_chat)):
+            await process_chat_message(msg_tag_admin)
+            self.assertFalse(mock_del.called, "Member tagging an admin MUST be allowed")
+
+        # 2. Regular member mentions non-admin member (@fellow_member) -> DELETED
+        msg_tag_member = types.Message.de_json({
+            "message_id": 602,
+            "from": {"id": member_id, "is_bot": False, "first_name": "MemberBob"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "Hey @fellow_member what do you think?"
+        })
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del:
+            await process_chat_message(msg_tag_member)
+            self.assertTrue(mock_del.called, "Member tagging non-admin member MUST be deleted immediately")
+
+        # 3. Regular member mentions outside channel (@crypto_pump_channel) -> DELETED
+        msg_tag_chan = types.Message.de_json({
+            "message_id": 603,
+            "from": {"id": member_id, "is_bot": False, "first_name": "MemberBob"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "Check out @crypto_pump_channel for signals"
+        })
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del:
+            await process_chat_message(msg_tag_chan)
+            self.assertTrue(mock_del.called, "Member tagging outside channel MUST be deleted immediately")
+
+        # 4. Regular member uses text_mention to non-admin user -> DELETED
+        msg_text_mention = types.Message.de_json({
+            "message_id": 604,
+            "from": {"id": member_id, "is_bot": False, "first_name": "MemberBob"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "Hey friend look at this",
+            "entities": [{"type": "text_mention", "offset": 4, "length": 6, "user": {"id": non_admin_id, "is_bot": False, "first_name": "Friend"}}]
+        })
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del:
+            await process_chat_message(msg_text_mention)
+            self.assertTrue(mock_del.called, "Member text_mention to non-admin MUST be deleted immediately")
+
+        # 5. Regular member uses text_mention to group admin -> ALLOWED
+        msg_text_mention_admin = types.Message.de_json({
+            "message_id": 605,
+            "from": {"id": member_id, "is_bot": False, "first_name": "MemberBob"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "Hey admin check this",
+            "entities": [{"type": "text_mention", "offset": 4, "length": 5, "user": {"id": admin_id, "is_bot": False, "first_name": "Boss"}}]
+        })
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del,              patch.object(bot, "get_chat", new=AsyncMock(return_value=mock_clean_chat)):
+            await process_chat_message(msg_text_mention_admin)
+            self.assertFalse(mock_del.called, "Member text_mention to group admin MUST be allowed")
+
+        # 6. Admin mentions non-admin (@fellow_member) -> ALLOWED (Admins have full freedom)
+        msg_admin_tag = types.Message.de_json({
+            "message_id": 606,
+            "from": {"id": admin_id, "is_bot": False, "first_name": "Boss"},
+            "chat": {"id": chat_id, "type": "supergroup"},
+            "date": int(time.time()),
+            "text": "Hey @fellow_member welcome to our group!"
+        })
+        mock_admin_chat = types.Chat.de_json({"id": admin_id, "type": "private", "bio": "Admin bio"})
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del,              patch.object(bot, "get_chat", new=AsyncMock(return_value=mock_admin_chat)):
+            await process_chat_message(msg_admin_tag)
+            self.assertFalse(mock_del.called, "Admin must be allowed to mention anyone")
+
+        # 7. When only_admin_mentions is toggled OFF (False) -> Member can mention anyone
+        config["only_admin_mentions"] = False
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del,              patch.object(bot, "get_chat", new=AsyncMock(return_value=mock_clean_chat)):
+            await process_chat_message(msg_tag_member)
+            self.assertFalse(mock_del.called, "When only_admin_mentions is False, member can mention anyone")
+
+        # 8. Test sub-setting view rendering for 'mention'
+        sub_text, sub_kb = await render_sub_setting(chat_id, "mention")
+        self.assertIn("Mention Restrictions", sub_text)
+        self.assertIn("Back to Settings", str(sub_kb.to_dict()))
+
 if __name__ == "__main__":
     unittest.main()
