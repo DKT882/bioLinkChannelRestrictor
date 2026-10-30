@@ -853,5 +853,37 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
             await process_chat_message(msg_admin)
             self.assertFalse(mock_del_freelink.called, "Whitelisted admin in free_links must be allowed")
 
+    async def test_pre_warm_cache_and_forward_tuple(self):
+        """Test pre-warming member cache on join and fast forward tuple inspection."""
+        from unittest.mock import AsyncMock, patch
+        from main import pre_warm_new_member_cache, is_forwarded_message, bio_cache, scan_user_bio
+
+        # 1. Test forward tuple check with origin
+        fwd_msg = types.Message.de_json({
+            "message_id": 999,
+            "chat": {"id": -100123, "type": "supergroup"},
+            "date": int(time.time()),
+            "forward_origin": {"type": "channel", "date": 123456, "message_id": 10, "chat": {"id": -100999, "type": "channel", "title": "Channel"}}
+        })
+        self.assertTrue(is_forwarded_message(fwd_msg))
+
+        # 2. Test pre-warming new member
+        bio_cache.clear()
+        mock_chat = types.Chat.de_json({"id": 556677, "type": "private", "bio": "Join t.me/fast"})
+        update = types.ChatMemberUpdated.de_json({
+            "chat": {"id": -100123, "type": "supergroup"},
+            "from": {"id": 111, "is_bot": False, "first_name": "Admin"},
+            "date": int(time.time()),
+            "old_chat_member": {"status": "left", "user": {"id": 556677, "is_bot": False, "first_name": "Newbie"}},
+            "new_chat_member": {"status": "member", "user": {"id": 556677, "is_bot": False, "first_name": "Newbie"}}
+        })
+
+        with patch.object(bot, "get_chat", new=AsyncMock(return_value=mock_chat)):
+            await pre_warm_new_member_cache(update)
+            # Give background task a moment
+            await asyncio.sleep(0.05)
+            self.assertIn(556677, bio_cache, "New member bio must be pre-warmed in bio_cache")
+            self.assertTrue(bio_cache[556677][0], "New member violation must be detected in pre-warm")
+
 if __name__ == "__main__":
     unittest.main()
