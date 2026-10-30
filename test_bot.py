@@ -513,7 +513,7 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         config["title"] = "Crypto Elite"
 
         for sub_type in ["bio", "links", "admlinks", "free", "freel", "notice", "delmsg", "promo", "apprv"]:
-            sub_text, sub_kb = render_sub_setting(chat_id, sub_type)
+            sub_text, sub_kb = await render_sub_setting(chat_id, sub_type)
             self.assertIn("Crypto Elite", sub_text)
             self.assertIn("Back to Settings", str(sub_kb.to_dict()))
 
@@ -531,7 +531,7 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Bio & Channel: ON", kb_dict)
 
         # Sub-view has Turn Filter OFF button
-        _, sub_kb = render_sub_setting(chat_id, "links")
+        _, sub_kb = await render_sub_setting(chat_id, "links")
         self.assertIn("Turn Filter OFF", str(sub_kb.to_dict()))
 
         # Toggle OFF
@@ -544,7 +544,7 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Bio & Channel: OFF", kb_off_dict)
 
         # Sub-view has Turn Filter ON button
-        _, sub_kb_off = render_sub_setting(chat_id, "links")
+        _, sub_kb_off = await render_sub_setting(chat_id, "links")
         self.assertIn("Turn Filter ON", str(sub_kb_off.to_dict()))
 
 
@@ -580,7 +580,7 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Notice: OFF", str(grid_kb_off.to_dict()))
 
         # 2. Sub-view has Turn Notice ON button
-        sub_text, sub_kb = render_sub_setting(chat_id, "notice")
+        sub_text, sub_kb = await render_sub_setting(chat_id, "notice")
         self.assertIn("Turn Notice ON", str(sub_kb.to_dict()))
         self.assertIn("Set Custom Message", str(sub_kb.to_dict()))
 
@@ -884,6 +884,44 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
             await asyncio.sleep(0.05)
             self.assertIn(556677, bio_cache, "New member bio must be pre-warmed in bio_cache")
             self.assertTrue(bio_cache[556677][0], "New member violation must be detected in pre-warm")
+
+    async def test_exempt_members_display_name_and_switching(self):
+        """Test that exempt members show username and name instead of just ID, and sub-view allows switching."""
+        from main import format_exempt_members_list, user_info_cache, render_sub_setting
+
+        chat_id = -100887766
+        config = get_group_config(chat_id)
+        config["title"] = "VIP Lounge"
+        config["free_list"] = {6857805548, 8476177398}
+        config["free_links"] = {6857805548}
+
+        user_info_cache[6857805548] = {"name": "Kamlesh", "username": "DKT882"}
+        user_info_cache[8476177398] = {"name": "Alice Wonderland", "username": "alice_w"}
+
+        # 1. Format exempt members list
+        formatted = await format_exempt_members_list(chat_id, config["free_list"])
+        self.assertIn("Kamlesh", formatted)
+        self.assertIn("@DKT882", formatted)
+        self.assertIn("6857805548", formatted)
+        self.assertIn("Alice Wonderland", formatted)
+        self.assertIn("@alice_w", formatted)
+        self.assertIn("8476177398", formatted)
+
+        # 2. Render sub_free
+        bio_text, bio_kb = await render_sub_setting(chat_id, "free")
+        self.assertIn("VIP Lounge", bio_text)
+        self.assertIn("Kamlesh", bio_text)
+        self.assertIn("@DKT882", bio_text)
+        self.assertIn("View Link Exempt Users", str(bio_kb.to_dict()))
+        self.assertIn("Refresh List", str(bio_kb.to_dict()))
+
+        # 3. Render sub_freel
+        link_text, link_kb = await render_sub_setting(chat_id, "freel")
+        self.assertIn("VIP Lounge", link_text)
+        self.assertIn("Kamlesh", link_text)
+        self.assertIn("@DKT882", link_text)
+        self.assertIn("View Bio Exempt Users", str(link_kb.to_dict()))
+        self.assertIn("Refresh List", str(link_kb.to_dict()))
 
 if __name__ == "__main__":
     unittest.main()

@@ -110,6 +110,9 @@ SETTINGS_FILE = "settings.json"
 # In-memory mapping from lowercase username to user_id (built dynamically)
 username_to_id: Dict[str, int] = {}
 
+# In-memory mapping from user_id to user profile metadata: user_id -> {"name": ..., "username": ...}
+user_info_cache: Dict[int, Dict[str, str]] = {}
+
 # Admin status cache: chat_id -> (set of admin user IDs, expire_monotonic_timestamp)
 admin_cache: Dict[int, Tuple[Set[int], Optional[int], float]] = {}
 
@@ -1019,7 +1022,63 @@ def render_group_settings_grid(chat_id: int) -> Tuple[str, types.InlineKeyboardM
     return text, markup
 
 
-def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.InlineKeyboardMarkup]:
+async def format_exempt_members_list(chat_id: int, user_ids: Set[int]) -> str:
+    """
+    Formats the list of exempt member user IDs into readable rows with
+    their Name, @username, and User ID. Resolves unknown members via Telegram API.
+    """
+    if not user_ids:
+        return "<i>No members currently on this list.</i>"
+
+    lines = []
+    sorted_uids = sorted(list(user_ids))
+    for idx, uid in enumerate(sorted_uids, start=1):
+        cached = user_info_cache.get(uid)
+        display_name = ""
+        uname = ""
+        if cached:
+            display_name = cached.get("name", "")
+            uname = cached.get("username", "")
+
+        # If not cached, attempt resolution via Telegram API
+        if not display_name and not uname:
+            try:
+                cm = await bot.get_chat_member(chat_id, uid)
+                if cm and cm.user:
+                    u = cm.user
+                    display_name = (u.first_name or "") + (f" {u.last_name}" if getattr(u, "last_name", None) else "")
+                    uname = u.username or ""
+                    user_info_cache[uid] = {"name": display_name, "username": uname}
+                    if uname:
+                        username_to_id[uname.lower()] = uid
+            except Exception:
+                try:
+                    c = await bot.get_chat(uid)
+                    if c:
+                        display_name = (c.first_name or "") + (f" {c.last_name}" if getattr(c, "last_name", None) else "")
+                        if not display_name:
+                            display_name = c.title or ""
+                        uname = c.username or ""
+                        user_info_cache[uid] = {"name": display_name, "username": uname}
+                        if uname:
+                            username_to_id[uname.lower()] = uid
+                except Exception:
+                    pass
+
+        # Build clean formatted row
+        if display_name and uname:
+            lines.append(f"{idx}. 👤 <b>{html.escape(display_name)}</b> (@{html.escape(uname)}) — <code>{uid}</code>")
+        elif uname:
+            lines.append(f"{idx}. 👤 @{html.escape(uname)} — <code>{uid}</code>")
+        elif display_name:
+            lines.append(f"{idx}. 👤 <b>{html.escape(display_name)}</b> — <code>{uid}</code>")
+        else:
+            lines.append(f"{idx}. 👤 Member — <code>{uid}</code>")
+
+    return "\n".join(lines)
+
+
+async def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.InlineKeyboardMarkup]:
     """
     Renders detailed sub-views when a specific setting button in the grid is clicked.
     """
@@ -1079,30 +1138,50 @@ def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.InlineKe
         markup.add(types.InlineKeyboardButton(toggle_label, callback_data=f"toggle_admlink_{chat_id}"))
     elif sub_type == "free":
         free_list = config.get("free_list", set())
-        users_str = ", ".join(f"<code>{uid}</code>" for uid in list(free_list)[:15]) or "<i>None</i>"
+        members_text = await format_exempt_members_list(chat_id, free_list)
         text = (
             f"👥 <b>Bio Exempt Users (/free)</b>\n"
             f"<b>Group:</b> {html.escape(title)}\n\n"
-            f"• <b>Total Exempt:</b> <code>{len(free_list)}</code>\n"
-            f"• <b>Exempt User IDs:</b> {users_str}\n\n"
+            f"• <b>Total Exempt:</b> <code>{len(free_list)}</code>\n\n"
+            f"📋 <b>Exempt Members List:</b>\n"
+            f"{members_text}\n\n"
             f"<b>Commands:</b>\n"
             f"• <code>/free &lt;reply or @user&gt;</code> - Exempt member from bio scans\n"
-            f"• <code>/unfree &lt;reply or @user&gt;</code> - Revoke bio exemption\n\n"
-            f"<i>(Only the Group Owner and Anonymous Admin can exempt users)</i>"
+            f"• <code>/unfree &lt;reply or @user&gt;</code> - Revoke bio exemption\n"
+            f"• <code>/free link &lt;reply or @user&gt;</code> - Allow member to send in-chat links\n"
+            f"• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link permission\n\n"
+            f"<i>(Only the Group Owner and Anonymous Admin can manage exemptions)</i>"
         )
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.row(types.InlineKeyboardButton("🔗 View Link Exempt Users", callback_data=f"sub_freel_{chat_id}"))
+        markup.row(
+            types.InlineKeyboardButton("🔄 Refresh List", callback_data=f"sub_free_{chat_id}"),
+            types.InlineKeyboardButton("⬅️ Back to Settings", callback_data=f"grp_{chat_id}")
+        )
+        return text, markup
     elif sub_type == "freel":
         free_links = config.get("free_links", set())
-        users_str = ", ".join(f"<code>{uid}</code>" for uid in list(free_links)[:15]) or "<i>None</i>"
+        members_text = await format_exempt_members_list(chat_id, free_links)
         text = (
-            f"🔗 <b>Link Allowed Users (/free link)</b>\n"
+            f"🔗 <b>Link Allowed / Exempt Users (/free link)</b>\n"
             f"<b>Group:</b> {html.escape(title)}\n\n"
-            f"• <b>Total Authorized:</b> <code>{len(free_links)}</code>\n"
-            f"• <b>Authorized User IDs:</b> {users_str}\n\n"
+            f"• <b>Total Authorized:</b> <code>{len(free_links)}</code>\n\n"
+            f"📋 <b>Authorized Members List:</b>\n"
+            f"{members_text}\n\n"
             f"<b>Commands:</b>\n"
             f"• <code>/free link &lt;reply or @user&gt;</code> - Allow user to send in-chat links\n"
-            f"• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link permission\n\n"
+            f"• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link permission\n"
+            f"• <code>/free &lt;reply or @user&gt;</code> - Exempt member from bio scans\n"
+            f"• <code>/unfree &lt;reply or @user&gt;</code> - Revoke bio exemption\n\n"
             f"<i>(Only the Group Owner and Anonymous Admin can manage link permissions)</i>"
         )
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.row(types.InlineKeyboardButton("👥 View Bio Exempt Users", callback_data=f"sub_free_{chat_id}"))
+        markup.row(
+            types.InlineKeyboardButton("🔄 Refresh List", callback_data=f"sub_freel_{chat_id}"),
+            types.InlineKeyboardButton("⬅️ Back to Settings", callback_data=f"grp_{chat_id}")
+        )
+        return text, markup
     elif sub_type == "notice":
         custom_msg = config.get("custom_bio_msg")
         send_notice = config.get("send_bio_notice", True)
@@ -1326,9 +1405,9 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
 
             msg_text = call.message.text or ""
             if "Admin Link" in msg_text:
-                text, markup = render_sub_setting(chat_id, "admlinks")
+                text, markup = await render_sub_setting(chat_id, "admlinks")
             elif "In-Chat Links" in msg_text:
-                text, markup = render_sub_setting(chat_id, "links")
+                text, markup = await render_sub_setting(chat_id, "links")
             else:
                 text, markup = render_group_settings_grid(chat_id)
 
@@ -1424,7 +1503,7 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
             # If user is in the sub-screen, re-render sub-screen; else re-render settings grid
             msg_text = call.message.text or ""
             if "In-Chat Links" in msg_text:
-                text, markup = render_sub_setting(chat_id, "links")
+                text, markup = await render_sub_setting(chat_id, "links")
             else:
                 text, markup = render_group_settings_grid(chat_id)
 
@@ -1454,7 +1533,7 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
             # If user is in the sub-screen, re-render sub-screen; else re-render settings grid
             msg_text = call.message.text or ""
             if "Bio & Connected Channel" in msg_text:
-                text, markup = render_sub_setting(chat_id, "bio")
+                text, markup = await render_sub_setting(chat_id, "bio")
             else:
                 text, markup = render_group_settings_grid(chat_id)
 
@@ -1483,7 +1562,7 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
 
             msg_text = call.message.text or ""
             if "Bio Deletion Notice" in msg_text:
-                text, markup = render_sub_setting(chat_id, "notice")
+                text, markup = await render_sub_setting(chat_id, "notice")
             else:
                 text, markup = render_group_settings_grid(chat_id)
 
@@ -1541,7 +1620,7 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
             if db_manager.is_connected:
                 asyncio.create_task(db_manager.reset_custom_bio_msg(chat_id))
 
-            text, markup = render_sub_setting(chat_id, "notice")
+            text, markup = await render_sub_setting(chat_id, "notice")
             await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
             await bot.answer_callback_query(call.id, "Notice reset to default (@i_am_turtle)")
         except Exception as e:
@@ -1559,7 +1638,7 @@ async def handle_dashboard_callbacks(call: types.CallbackQuery):
                 await bot.answer_callback_query(call.id, "⚠️ Administrator permissions required.", show_alert=True)
                 return
 
-            text, markup = render_sub_setting(chat_id, sub_type)
+            text, markup = await render_sub_setting(chat_id, sub_type)
             await bot.edit_message_text(text, chat_id=call.message.chat.id, message_id=call.message.message_id, parse_mode="HTML", reply_markup=markup)
             await bot.answer_callback_query(call.id)
         except Exception as e:
@@ -1793,6 +1872,8 @@ async def cmd_free(message: types.Message):
         target_user_id = target.id
         target_display = get_user_mention(target)
         clean_uname = target.username.lower() if target.username else ""
+        t_name = (target.first_name or "") + (f" {target.last_name}" if getattr(target, 'last_name', None) else "")
+        user_info_cache[target_user_id] = {"name": t_name, "username": target.username or ""}
 
     # Target Method 2: Argument specified (e.g., /free @username or /free link @username)
     elif len(parts) > arg_index:
@@ -1827,22 +1908,25 @@ async def cmd_free(message: types.Message):
                 except Exception:
                     pass
 
-    # Target resolution failed -> Show informative usage help
+    # Target resolution failed -> Show informative usage help + current exempt members list
     if not target_user_id:
+        free_list = group_config.get("free_list", set())
+        free_links = group_config.get("free_links", set())
+        bio_members_text = await format_exempt_members_list(chat_id, free_list)
+        link_members_text = await format_exempt_members_list(chat_id, free_links)
         usage_msg = (
-            "ℹ️ <b>How to Use /free:</b>\n\n"
-            "• <b>Bio Exemption (Exempts bio link & connected channel check):</b>\n"
-            "  ↳ Reply to their message with <code>/free</code>\n"
-            "  ↳ Or send: <code>/free @username</code>\n"
-            "  ↳ Or send: <code>/free &lt;user_id&gt;</code>\n\n"
-            "• <b>Link Permission (Allows sending links & forwards in chat):</b>\n"
-            "  ↳ Reply to their message with <code>/free link</code>\n"
-            "  ↳ Or send: <code>/free link @username</code>\n"
-            "  ↳ Or send: <code>/free link &lt;user_id&gt;</code>\n\n"
-            "<i>(Only the Group Owner and Anonymous Admin can execute this)</i>"
+            f"ℹ️ <b>Exemption Management ({html.escape(group_config.get('title') or 'Group')})</b>\n\n"
+            f"👥 <b>Bio Exempt Users ({len(free_list)}):</b>\n{bio_members_text}\n\n"
+            f"🔗 <b>Link Allowed / Exempt Users ({len(free_links)}):</b>\n{link_members_text}\n\n"
+            f"<b>How to Grant:</b>\n"
+            f"• <b>Bio Exemption:</b> Reply with <code>/free</code> or send <code>/free @username</code>\n"
+            f"• <b>Link Permission:</b> Reply with <code>/free link</code> or send <code>/free link @username</code>\n\n"
+            f"<b>How to Revoke:</b>\n"
+            f"• <code>/unfree &lt;user&gt;</code> or <code>/unfree link &lt;user&gt;</code>\n\n"
+            f"<i>(Only the Group Owner and Anonymous Admin can manage exemptions)</i>"
         )
         reply = await bot.reply_to(message, usage_msg, parse_mode="HTML")
-        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 25))
+        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 35))
         return
 
     # Case A: /free link (Grant link sending permission)
@@ -2437,10 +2521,20 @@ async def process_chat_message(message: types.Message):
         (message.from_user and message.from_user.id == ANONYMOUS_ADMIN_USER_ID)
     )
 
-    # Sender ID resolution (handles regular user, external channel, or bot)
-    user_id = message.from_user.id if message.from_user else (message.sender_chat.id if message.sender_chat else 0)
+    # Sender ID resolution and dynamic user metadata tracking
+    user = message.from_user
+    user_id = user.id if user else (message.sender_chat.id if message.sender_chat else 0)
     if not user_id:
         return
+
+    if user:
+        u_name = (user.first_name or "") + (f" {user.last_name}" if getattr(user, "last_name", None) else "")
+        user_info_cache[user.id] = {
+            "name": u_name,
+            "username": user.username or ""
+        }
+        if user.username:
+            username_to_id[user.username.lower()] = user.id
 
     # --------------------------------------------------------------------------
     # Check 1: In-Chat Link & Table Button Restriction (PRIORITY 1 - INSTANT SCAN)
