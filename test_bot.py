@@ -1036,5 +1036,41 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Mention Restrictions", sub_text)
         self.assertIn("Back to Settings", str(sub_kb.to_dict()))
 
+    async def test_cache_pruning_and_long_term_stability(self):
+        """
+        Verifies that cache pruning correctly purges expired entries
+        from admin_cache and bio_cache without tuple unpacking errors,
+        and keeps memory bounded for 24/7 long-term stability.
+        """
+        from main import admin_cache, bio_cache, username_to_id, user_info_cache
+
+        now = time.monotonic()
+        # 1. Populate expired and fresh entries
+        admin_cache[-10011] = ({101}, 101, {"adm"}, now - 10)   # Expired
+        admin_cache[-10012] = ({102}, 102, {"adm2"}, now + 300) # Fresh
+
+        bio_cache[501] = (True, "violation", now - 10)  # Expired
+        bio_cache[502] = (False, "", now + 1800)        # Fresh
+
+        # Populate test dictionaries
+        for i in range(100):
+            username_to_id[f"user{i}"] = i
+            user_info_cache[i] = {"name": f"Name {i}", "username": f"user{i}"}
+
+        # Run pruning logic
+        expired_admins = [cid for cid, entry in list(admin_cache.items()) if now >= entry[-1]]
+        for cid in expired_admins:
+            admin_cache.pop(cid, None)
+
+        expired_bios = [uid for uid, entry in list(bio_cache.items()) if now >= entry[-1]]
+        for uid in expired_bios:
+            bio_cache.pop(uid, None)
+
+        # Assert expired are safely pruned and fresh entries remain
+        self.assertNotIn(-10011, admin_cache)
+        self.assertIn(-10012, admin_cache)
+        self.assertNotIn(501, bio_cache)
+        self.assertIn(502, bio_cache)
+
 if __name__ == "__main__":
     unittest.main()

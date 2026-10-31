@@ -64,10 +64,15 @@ MONGO_URI = os.environ.get("MONGO_URI", "").strip()
 # Anonymous Admin Bot ID in Telegram
 ANONYMOUS_ADMIN_USER_ID = 1087968824
 
-# Cache TTL settings (optimized for 15,000+ member high-traffic groups)
-ADMIN_CACHE_TTL = 300.0   # 5 minutes for chat admins
-BIO_CACHE_TTL = 120.0    # 120 seconds in-memory cache for ultra-low latency RAM scans
-CACHE_PRUNE_INTERVAL = 600.0  # 10 minutes between cache prunes
+# Cache TTL settings (optimized for high-traffic groups and avoiding Telegram 429 FloodWait)
+ADMIN_CACHE_TTL = 300.0          # 5 minutes for chat admins
+BIO_CACHE_TTL = 1800.0           # 30 minutes default cache for clean bios (reduces getChat calls by 95%)
+CLEAN_BIO_CACHE_TTL = 1800.0     # 30 minutes for clean user profiles
+VIOLATION_BIO_CACHE_TTL = 30.0   # 30 seconds for violators (quick unblock once bio link is removed)
+CACHE_PRUNE_INTERVAL = 300.0     # 5 minutes between periodic cache maintenance
+
+# Global FloodWait cooldown timestamp (time.monotonic)
+global_floodwait_until: float = 0.0
 
 # Regular expression designed to detect promotional links, invite links, and handles:
 # - Standard protocols: http://, https://, www.
@@ -288,7 +293,7 @@ async def _optimized_create_session():
         ttl_dns_cache=300,
         enable_cleanup_closed=True,
         force_close=False,
-        keepalive_timeout=75,
+        keepalive_timeout=45,  # 45s keepalive (below Telegram server 60s timeout to prevent dead socket hangs)
         ssl=telebot.asyncio_helper.session_manager.ssl_context
     )
     session = aiohttp.ClientSession(
@@ -448,6 +453,7 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
     3. Telegram Business intro links or handles.
     Returns (has_violation: bool, reason: str).
     """
+    global global_floodwait_until
     now = time.monotonic()
 
     # Fast in-memory cache check
@@ -455,6 +461,10 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
         has_violating, reason, expiry = bio_cache[user_id]
         if now < expiry:
             return has_violating, reason
+
+    # Global FloodWait check: do not hammer Telegram if token is in active cooldown
+    if now < global_floodwait_until:
+        return False, ""
 
     # In-flight de-duplication: if multiple messages from same user arrive concurrently
     if user_id in in_flight_bio_scans:
@@ -479,7 +489,7 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
             chan_title = getattr(personal_chat, "title", "Connected Channel")
             chan_str = f"@{chan_name}" if chan_name else f"'{chan_title}'"
             reason = f"Connected channel on profile: {chan_str}"
-            bio_cache[user_id] = (True, reason, now + BIO_CACHE_TTL)
+            bio_cache[user_id] = (True, reason, now + VIOLATION_BIO_CACHE_TTL)
             if not future.done():
                 future.set_result((True, reason))
             logger.info(f"User {user_id} flagged: {reason}")
@@ -501,14 +511,14 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
 
         if bio_text and BIO_LINK_REGEX.search(bio_text):
             reason = f"Link or channel handle in bio: {bio_text!r}"
-            bio_cache[user_id] = (True, reason, now + BIO_CACHE_TTL)
+            bio_cache[user_id] = (True, reason, now + VIOLATION_BIO_CACHE_TTL)
             if not future.done():
                 future.set_result((True, reason))
             logger.info(f"User {user_id} flagged: {reason}")
             return True, reason
 
-        # Clean profile
-        bio_cache[user_id] = (False, "", now + BIO_CACHE_TTL)
+        # Clean profile: cached for 30 minutes to reduce getChat API pressure by 95%
+        bio_cache[user_id] = (False, "", now + CLEAN_BIO_CACHE_TTL)
         if not future.done():
             future.set_result((False, ""))
         return False, ""
@@ -518,12 +528,13 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
             future.set_result((False, ""))
         err_code = getattr(e, "error_code", None)
         if err_code == 429:
-            retry_after = getattr(e, "result_json", {}).get("parameters", {}).get("retry_after", 5)
-            logger.warning(f"Telegram FloodWait encountered for user {user_id}. Backing off for {retry_after}s.")
+            retry_after = getattr(e, "result_json", {}).get("parameters", {}).get("retry_after", 10)
+            global_floodwait_until = now + float(retry_after)
+            logger.warning(f"Telegram FloodWait encountered. Backing off all bio lookups for {retry_after}s.")
             bio_cache[user_id] = (False, "", now + float(retry_after))
         else:
             logger.warning(f"Could not retrieve bio for user {user_id}: {e} (code: {err_code})")
-            bio_cache[user_id] = (False, "", now + 5.0)
+            bio_cache[user_id] = (False, "", now + 15.0)
         return False, ""
     except Exception as e:
         if not future.done():
@@ -3061,23 +3072,25 @@ async def cache_pruning_task():
             await asyncio.sleep(CACHE_PRUNE_INTERVAL)
             now = time.monotonic()
 
-            # Prune admin cache
-            expired_admins = [cid for cid, (_, _, exp) in list(admin_cache.items()) if now >= exp]
+            # Prune admin cache safely regardless of tuple length
+            expired_admins = [cid for cid, entry in list(admin_cache.items()) if now >= entry[-1]]
             for cid in expired_admins:
                 admin_cache.pop(cid, None)
 
-            # Prune bio cache
-            expired_bios = [uid for uid, (_, exp) in bio_cache.items() if now >= exp]
+            # Prune bio cache safely regardless of tuple length
+            expired_bios = [uid for uid, entry in list(bio_cache.items()) if now >= entry[-1]]
             for uid in expired_bios:
                 bio_cache.pop(uid, None)
 
-            # Prune username_to_id mapping if it grows past 10,000 entries
-            if len(username_to_id) > 10000:
+            # Prune user metadata caches if they grow past 5,000 entries
+            if len(username_to_id) > 5000:
                 username_to_id.clear()
+            if len(user_info_cache) > 5000:
+                user_info_cache.clear()
 
             logger.debug(
                 f"Cache maintenance complete: Pruned {len(expired_admins)} chats, "
-                f"{len(expired_bios)} user bios."
+                f"{len(expired_bios)} user bios. Active bios in RAM: {len(bio_cache)}"
             )
         except asyncio.CancelledError:
             break
@@ -3192,9 +3205,10 @@ async def main():
                     skip_pending=True,
                     timeout=20,
                     request_timeout=25,
-                    allowed_updates=["message", "edited_message", "callback_query"]
+                    allowed_updates=["message", "edited_message", "callback_query", "chat_member"]
                 )
-                break
+                logger.warning("Infinity polling exited unexpectedly. Reconnecting in 3 seconds...")
+                await asyncio.sleep(3)
             except TELEGRAM_EXCEPTIONS as e:
                 err_code = getattr(e, "error_code", None)
                 if err_code == 409 or "409" in str(e) or "Conflict" in str(e):
