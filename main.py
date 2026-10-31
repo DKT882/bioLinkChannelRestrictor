@@ -286,24 +286,33 @@ bot = AsyncTeleBot(token=BOT_TOKEN or "123456789:AAFDummyTokenForValidationCheck
 # 2. keepalive_timeout=75 (Persistent hot socket reuse; eliminates 30-50ms TLS handshakes)
 # 3. limit=100, limit_per_host=50 (High concurrency connection pool)
 # 4. enable_cleanup_closed=True, force_close=False (Strict HTTP keep-alive)
+# Hard cap on Telebot API request timeout (default is 300s!)
+# Setting it to 6s guarantees no stalled request can ever freeze the bot!
+telebot.asyncio_helper.REQUEST_TIMEOUT = 6
+
 async def _optimized_create_session():
     connector = aiohttp.TCPConnector(
-        limit=100,
-        limit_per_host=50,
-        ttl_dns_cache=300,
+        limit=200,
+        limit_per_host=100,
+        ttl_dns_cache=600,
         enable_cleanup_closed=True,
         force_close=False,
-        keepalive_timeout=45,  # 45s keepalive (below Telegram server 60s timeout to prevent dead socket hangs)
+        keepalive_timeout=30,  # 30s keepalive ensures clean socket cycling and zero dead sockets
         ssl=telebot.asyncio_helper.session_manager.ssl_context
     )
+    timeout = aiohttp.ClientTimeout(total=8, connect=3)
     session = aiohttp.ClientSession(
         connector=connector,
+        timeout=timeout,
         json_serialize=json.dumps
     )
     telebot.asyncio_helper.session_manager.session = session
     return session
 
 telebot.asyncio_helper.session_manager.create_session = _optimized_create_session
+
+# Rate-limiting semaphore for concurrent bio profile lookups (prevents Telegram 429 burst bans)
+bio_scan_semaphore = asyncio.Semaphore(10)
 
 # ------------------------------------------------------------------------------
 # 5. CORE HELPER FUNCTIONS & ADMIN VERIFICATION
@@ -478,7 +487,22 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
     in_flight_bio_scans[user_id] = future
 
     try:
-        chat = await bot.get_chat(user_id)
+        chat = None
+        async with bio_scan_semaphore:
+            try:
+                chat = await asyncio.wait_for(bot.get_chat(user_id), timeout=3.0)
+            except (asyncio.TimeoutError, Exception) as fetch_err:
+                # Immediate quick retry in case of transient network hiccup
+                try:
+                    chat = await asyncio.wait_for(bot.get_chat(user_id), timeout=2.5)
+                except Exception:
+                    chat = None
+
+        if chat is None:
+            # Do NOT poison cache with False on network timeout!
+            if not future.done():
+                future.set_result((False, ""))
+            return False, ""
 
         # ----------------------------------------------------------------------
         # Check 1: Connected Channel attached to user's profile
@@ -531,10 +555,9 @@ async def scan_user_bio(user_id: int) -> Tuple[bool, str]:
             retry_after = getattr(e, "result_json", {}).get("parameters", {}).get("retry_after", 10)
             global_floodwait_until = now + float(retry_after)
             logger.warning(f"Telegram FloodWait encountered. Backing off all bio lookups for {retry_after}s.")
-            bio_cache[user_id] = (False, "", now + float(retry_after))
         else:
             logger.warning(f"Could not retrieve bio for user {user_id}: {e} (code: {err_code})")
-            bio_cache[user_id] = (False, "", now + 15.0)
+        # Do NOT cache False for user when Telegram API has an error
         return False, ""
     except Exception as e:
         if not future.done():
