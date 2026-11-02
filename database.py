@@ -149,7 +149,8 @@ class DatabaseManager:
                     "filter_admin_links": doc.get("filter_admin_links", not doc.get("ignore_admins", False)),
                     "filter_admin_bio": doc.get("filter_admin_bio", not doc.get("ignore_admins", False)),
                     "send_bio_notice": doc.get("send_bio_notice", True),
-                    "only_admin_mentions": doc.get("only_admin_mentions", True)
+                    "only_admin_mentions": doc.get("only_admin_mentions", True),
+                    "filter_bot_links": doc.get("filter_bot_links", True)
                 }
             logger.info(f"Loaded {len(groups_dict)} group(s) from MongoDB.")
         except Exception as e:
@@ -169,7 +170,8 @@ class DatabaseManager:
         send_bio_notice: Optional[bool] = None,
         filter_admin_links: Optional[bool] = None,
         filter_admin_bio: Optional[bool] = None,
-        only_admin_mentions: Optional[bool] = None
+        only_admin_mentions: Optional[bool] = None,
+        filter_bot_links: Optional[bool] = None
     ):
         """
         Persists or updates group settings in MongoDB atomically.
@@ -203,6 +205,8 @@ class DatabaseManager:
                 update_fields["filter_admin_bio"] = filter_admin_bio
             if only_admin_mentions is not None:
                 update_fields["only_admin_mentions"] = only_admin_mentions
+            if filter_bot_links is not None:
+                update_fields["filter_bot_links"] = filter_bot_links
 
             await self.db["groups"].update_one(
                 {"_id": chat_id},
@@ -223,6 +227,7 @@ class DatabaseManager:
                         "filter_admin_bio": filter_admin_bio if filter_admin_bio is not None else True,
                         "send_bio_notice": send_bio_notice if send_bio_notice is not None else True,
                         "only_admin_mentions": only_admin_mentions if only_admin_mentions is not None else True,
+                        "filter_bot_links": filter_bot_links if filter_bot_links is not None else True,
                         "created_at": now
                     }
                 },

@@ -1072,5 +1072,216 @@ class TestPrivateDashboard(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(501, bio_cache)
         self.assertIn(502, bio_cache)
 
+
+
+class TestBotLinkFiltering(unittest.IsolatedAsyncioTestCase):
+    """
+    Comprehensive tests for Telegram Bot link, @*bot username, deep link,
+    WebApp, inline bot, and bot forward detection and filtering.
+    """
+    def setUp(self):
+        active_groups.clear()
+        admin_cache.clear()
+
+    def test_default_filter_bot_links_is_true(self):
+        cfg = get_group_config(-100999)
+        self.assertTrue(cfg.get("filter_bot_links", True), "Bot link filtering must default to True")
+
+    def test_bot_url_detected(self):
+        for bot_url in [
+            "https://t.me/CryptoGameBot",
+            "http://t.me/MyAwesome_Bot",
+            "t.me/blum_bot?startapp=ref_12345",
+            "https://telegram.me/giveaway_bot",
+            "telegram.dog/crypto_bot",
+            "tg://resolve?domain=FreeSpinBot",
+            "tg://startapp?bot=tapper_bot",
+            "Check this out: t.me/spambot and start earning!",
+        ]:
+            msg = types.Message(
+                message_id=1,
+                from_user=types.User(id=201, is_bot=False, first_name="User"),
+                date=int(time.time()),
+                chat=types.Chat(id=-1001, type="supergroup"),
+                content_type="text",
+                options={},
+                json_string=""
+            )
+            msg.text = bot_url
+            msg.entities = []
+            has_link, reason = detect_chat_link(msg, check_web_links=True, filter_bot_links=True)
+            self.assertTrue(has_link, f"Failed to detect bot url: {bot_url}")
+
+    def test_bot_username_mention(self):
+        msg = types.Message(
+            message_id=2,
+            from_user=types.User(id=202, is_bot=False, first_name="User"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Join now with @free_coins_bot"
+        msg.entities = [types.MessageEntity(type="mention", offset=14, length=15)]
+        has_link, reason = detect_chat_link(msg, check_web_links=True, filter_bot_links=True)
+        self.assertTrue(has_link)
+        self.assertIn("bot", reason.lower())
+
+    def test_bot_forward_detected(self):
+        json_data = {
+            'message_id': 3,
+            'from': {'id': 203, 'is_bot': False, 'first_name': 'User'},
+            'chat': {'id': -1001, 'type': 'supergroup'},
+            'date': int(time.time()),
+            'text': 'Forwarded announcement',
+            'forward_from': {'id': 888, 'is_bot': True, 'first_name': 'AnnounceBot', 'username': 'announcebot'}
+        }
+        msg = types.Message.de_json(json_data)
+        has_link, reason = detect_chat_link(msg, check_web_links=False, filter_bot_links=True)
+        self.assertTrue(has_link)
+        self.assertIn("bot", reason.lower())
+
+    def test_inline_bot_detected(self):
+        msg = types.Message(
+            message_id=4,
+            from_user=types.User(id=204, is_bot=False, first_name="User"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Result from inline"
+        msg.via_bot = types.User(id=999, is_bot=True, first_name="Giphy", username="gif")
+        has_link, reason = detect_chat_link(msg, check_web_links=False, filter_bot_links=True)
+        self.assertTrue(has_link)
+        self.assertIn("inline bot", reason.lower())
+
+    def test_inline_keyboard_buttons_for_bots(self):
+        # WebApp button
+        msg = types.Message(
+            message_id=5,
+            from_user=types.User(id=205, is_bot=False, first_name="User"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Play game now"
+        markup = types.InlineKeyboardMarkup()
+        markup.add(types.InlineKeyboardButton("Play Game", web_app=types.WebAppInfo(url="https://app.example.com")))
+        msg.reply_markup = markup
+        has_link, reason = detect_chat_link(msg, check_web_links=False, filter_bot_links=True)
+        self.assertTrue(has_link)
+        self.assertIn("web app", reason.lower())
+
+    def test_independent_of_web_links(self):
+        # When check_web_links=False (standard websites allowed), bot links must STILL be deleted
+        msg_web = types.Message(
+            message_id=6,
+            from_user=types.User(id=206, is_bot=False, first_name="User"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg_web.text = "Check out https://github.com/project and https://google.com"
+        msg_web.entities = []
+        has_link, _ = detect_chat_link(msg_web, check_web_links=False, filter_bot_links=True)
+        self.assertFalse(has_link, "Standard web links must be allowed when check_web_links=False")
+
+        # But bot links must be caught
+        msg_bot = types.Message(
+            message_id=7,
+            from_user=types.User(id=206, is_bot=False, first_name="User"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg_bot.text = "Visit https://t.me/claim_gift_bot?start=123"
+        msg_bot.entities = []
+        has_link, reason = detect_chat_link(msg_bot, check_web_links=False, filter_bot_links=True)
+        self.assertTrue(has_link, "Bot link must be caught even when web links are allowed")
+
+    def test_filter_bot_links_disabled(self):
+        # When filter_bot_links=False and check_web_links=False, bot links are allowed
+        msg = types.Message(
+            message_id=8,
+            from_user=types.User(id=207, is_bot=False, first_name="User"),
+            date=int(time.time()),
+            chat=types.Chat(id=-1001, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg.text = "Visit https://t.me/claim_gift_bot"
+        msg.entities = []
+        has_link, _ = detect_chat_link(msg, check_web_links=False, filter_bot_links=False)
+        self.assertFalse(has_link, "Bot links allowed when filter_bot_links=False")
+
+    async def test_botlink_dashboard_and_sub_view(self):
+        chat_id = -100445566
+        cfg = get_group_config(chat_id)
+        cfg["title"] = "Crypto Lounge"
+        grid_text, grid_markup = render_group_settings_grid(chat_id)
+        self.assertIn("Bot Links", grid_text)
+        self.assertIn("toggle_botlink_", str(grid_markup.to_dict()))
+        self.assertIn("sub_botlink_", str(grid_markup.to_dict()))
+
+        sub_text, sub_markup = await render_sub_setting(chat_id, "botlink")
+        self.assertIn("Bot Link & WebApp Restrictions", sub_text)
+        self.assertIn("toggle_botlink_", str(sub_markup.to_dict()))
+
+    async def test_process_chat_message_bot_link_deletion(self):
+        from unittest.mock import patch, AsyncMock
+        chat_id = -100776655
+        cfg = get_group_config(chat_id)
+        cfg["filter_bot_links"] = True
+        cfg["filter_links"] = False  # web links off, bot links ON
+        cfg["filter_admin_links"] = False
+
+        admin_cache[chat_id] = ({999}, 999, {"admin"}, time.monotonic() + 300)
+
+        # 1. Regular member sends bot link -> deleted
+        msg_member = types.Message(
+            message_id=101,
+            from_user=types.User(id=301, is_bot=False, first_name="Regular"),
+            date=int(time.time()),
+            chat=types.Chat(id=chat_id, type="supergroup", title="Test Group"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg_member.text = "Play at t.me/my_game_bot?startapp=play"
+        msg_member.entities = []
+
+        mock_clean_chat = types.Chat(id=301, type="private", bio="clean bio")
+
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del,              patch.object(bot, "get_chat", new=AsyncMock(return_value=mock_clean_chat)):
+            await process_chat_message(msg_member)
+            self.assertTrue(mock_del.called, "Regular member sending bot link must be deleted")
+
+        # 2. Admin sends bot link when admins exempt -> not deleted
+        msg_admin = types.Message(
+            message_id=102,
+            from_user=types.User(id=999, is_bot=False, first_name="Boss"),
+            date=int(time.time()),
+            chat=types.Chat(id=chat_id, type="supergroup", title="Test Group"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg_admin.text = "Check our official bot: t.me/official_bot"
+        msg_admin.entities = []
+
+        with patch.object(bot, "delete_message", new=AsyncMock()) as mock_del,              patch.object(bot, "get_chat", new=AsyncMock(return_value=mock_clean_chat)):
+            await process_chat_message(msg_admin)
+            self.assertFalse(mock_del.called, "Exempt admin sending bot link should not be deleted")
+
 if __name__ == "__main__":
     unittest.main()
