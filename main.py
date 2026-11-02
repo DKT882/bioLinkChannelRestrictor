@@ -2694,41 +2694,6 @@ async def cmd_status(message: types.Message):
     asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 25))
 
 
-@bot.message_handler(commands=["togglebotlinks", "botlinks"])
-async def cmd_togglebotlinks(message: types.Message):
-    """
-    /togglebotlinks: Toggles automatic bot link / webapp filtering on or off for the group.
-    Only group administrators or the owner can run this.
-    """
-    chat_id = message.chat.id
-    schedule_command_cleanup(message, delay=3)
-
-    if message.chat.type in ("group", "supergroup"):
-        user_id = message.from_user.id if message.from_user else 0
-        if not await is_user_admin(chat_id, user_id, message):
-            reply = await bot.reply_to(message, "❌ <i>Only group administrators can change bot link settings.</i>", parse_mode="HTML")
-            asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 10))
-            return
-
-        cfg = get_group_config(chat_id)
-        current = cfg.get("filter_bot_links", True)
-        new_val = not current
-        cfg["filter_bot_links"] = new_val
-        save_settings()
-        if db_manager.is_connected:
-            asyncio.create_task(db_manager.upsert_group(chat_id=chat_id, filter_bot_links=new_val))
-
-        status_text = "<b>BLOCKED ❌ (Default)</b> — All bot links, @*bot handles, WebApps, and bot forwards are deleted." if new_val else "<b>ALLOWED ✅</b> — Members may post bot links and WebApps."
-        reply = await bot.reply_to(
-            message,
-            f"🤖 <b>Bot Link Protection Updated</b>\n\nStatus: {status_text}",
-            parse_mode="HTML"
-        )
-        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
-    else:
-        await bot.reply_to(message, "ℹ️ <i>Use this command inside a group to toggle bot link protection, or manage it via /settings in DM.</i>", parse_mode="HTML")
-
-
 @bot.message_handler(commands=["togglementions", "onlyadminmentions"])
 async def cmd_togglementions(message: types.Message):
     """
@@ -3372,7 +3337,6 @@ async def register_bot_commands():
         types.BotCommand("setmsg", "Customize bio delete response message"),
         types.BotCommand("resetmsg", "Reset bio delete message to default"),
         types.BotCommand("getmsg", "View current bio delete message"),
-        types.BotCommand("togglebotlinks", "Toggle bot link & WebApp filter (default: ON)"),
         types.BotCommand("togglementions", "Toggle mention restriction (admins only)"),
         types.BotCommand("status", "Show current group protection status"),
         types.BotCommand("help", "Show complete command guide"),
