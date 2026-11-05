@@ -170,6 +170,34 @@ bot_metadata: Dict[str, Any] = {
     "connected": False
 }
 
+# Global Super Owner definition (@i_am_turtle)
+SUPER_OWNER_USERNAME: str = "i_am_turtle"
+SUPER_OWNER_IDS: Set[int] = set()
+
+_env_owner = os.getenv("OWNER_ID") or os.getenv("SUPER_OWNER_ID")
+if _env_owner:
+    try:
+        SUPER_OWNER_IDS.add(int(_env_owner.strip()))
+    except ValueError:
+        pass
+
+def is_super_owner(user_id: int, message: Optional[types.Message] = None, username: Optional[str] = None) -> bool:
+    """Sub-microsecond check if a user is the global bot super owner (@i_am_turtle)."""
+    if user_id and user_id in SUPER_OWNER_IDS:
+        return True
+    uname = username
+    if not uname and message and message.from_user:
+        uname = message.from_user.username
+    if uname and uname.lower().lstrip("@") == SUPER_OWNER_USERNAME:
+        if user_id:
+            SUPER_OWNER_IDS.add(user_id)
+            username_to_id[SUPER_OWNER_USERNAME] = user_id
+        return True
+    if user_id and username_to_id.get(SUPER_OWNER_USERNAME) == user_id:
+        SUPER_OWNER_IDS.add(user_id)
+        return True
+    return False
+
 # ------------------------------------------------------------------------------
 # 3. IN-MEMORY STATE, PERSISTENCE & CACHES
 # ------------------------------------------------------------------------------
@@ -216,6 +244,7 @@ def load_settings() -> Dict[int, Dict[str, Any]]:
                         "ignore_admins": cfg.get("ignore_admins", False),
                         "free_list": set(cfg.get("free_list", [])),
                         "free_links": set(cfg.get("free_links", [])),
+                        "exception_admins": set(cfg.get("exception_admins", [])),
                         "custom_bio_msg": cfg.get("custom_bio_msg", None),
                         "title": cfg.get("title", ""),
                         "filter_links": cfg.get("filter_links", True),
@@ -245,6 +274,7 @@ def save_settings():
                 "ignore_admins": cfg.get("ignore_admins", False),
                 "free_list": list(cfg.get("free_list", set())),
                 "free_links": list(cfg.get("free_links", set())),
+                "exception_admins": list(cfg.get("exception_admins", set())),
                 "custom_bio_msg": cfg.get("custom_bio_msg", None),
                 "title": cfg.get("title", ""),
                 "filter_links": cfg.get("filter_links", True),
@@ -280,6 +310,7 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
             "ignore_admins": False,
             "free_list": set(),
             "free_links": set(),
+            "exception_admins": set(),
             "custom_bio_msg": None,
             "title": "",
             "filter_links": True,
@@ -305,6 +336,8 @@ def get_group_config(chat_id: int) -> Dict[str, Any]:
         cfg["free_list"] = set()
     if "free_links" not in cfg:
         cfg["free_links"] = set()
+    if "exception_admins" not in cfg:
+        cfg["exception_admins"] = set()
     if "custom_bio_msg" not in cfg:
         cfg["custom_bio_msg"] = None
     if "title" not in cfg:
@@ -390,7 +423,19 @@ async def is_user_admin(chat_id: int, user_id: int, message: Optional[types.Mess
     """
     High-performance admin check with in-memory TTL caching and
     in-flight request de-duplication to prevent Telegram rate-limiting.
+    Super Owner (@i_am_turtle) and Exception Admins return True instantly!
     """
+    # 0. Global Super Owner (@i_am_turtle) - sub-microsecond
+    if is_super_owner(user_id, message):
+        return True
+
+    # 1. Group Exception Admin (Full admin rights across all commands) - sub-microsecond
+    group_config = active_groups.get(chat_id)
+    if group_config:
+        ex_admins = group_config.get("exception_admins", set())
+        if user_id in ex_admins:
+            return True
+
     # Check for Telegram Anonymous Admin indicators
     if message:
         if message.sender_chat and message.sender_chat.id == chat_id:
@@ -460,9 +505,23 @@ async def is_user_admin(chat_id: int, user_id: int, message: Optional[types.Mess
 
 async def is_owner_or_anonymous_admin(chat_id: int, user_id: int, message: Optional[types.Message] = None) -> bool:
     """
-    Verifies if the caller is the Group Owner (creator) or an Anonymous Admin.
-    Zero-network check when admin_cache is warm.
+    Verifies if caller has Owner/Super-Admin permissions:
+    1. Global Super Owner (@i_am_turtle) - sub-microsecond
+    2. Group Exception Admin (granted via /addadmin) - sub-microsecond
+    3. Telegram Anonymous Admin
+    4. Group Creator / Owner
     """
+    # 0. Global Super Owner (@i_am_turtle) - sub-microsecond
+    if is_super_owner(user_id, message):
+        return True
+
+    # 1. Group Exception Admin (All permissions of all commands) - sub-microsecond
+    group_config = active_groups.get(chat_id)
+    if group_config:
+        ex_admins = group_config.get("exception_admins", set())
+        if user_id in ex_admins:
+            return True
+
     if message:
         # Sender posting anonymously as the group
         if message.sender_chat and message.sender_chat.id == chat_id:
@@ -1084,15 +1143,17 @@ async def execute_action(message: types.Message, action: str, reason: str = ""):
 # 5b. PRIVATE CHAT & GROUP HELP STYLE INTERACTIVE DASHBOARD
 # ------------------------------------------------------------------------------
 
-async def get_admin_managed_groups(user_id: int) -> List[Tuple[int, str, Dict[str, Any]]]:
+async def get_admin_managed_groups(user_id: int, username: Optional[str] = None) -> List[Tuple[int, str, Dict[str, Any]]]:
     """
     Finds all active groups where user_id is an Administrator or Owner.
+    Global super owner (@i_am_turtle) has access to manage all connected groups!
     Returns list of (chat_id, title, group_config).
     """
     managed = []
+    is_owner = is_super_owner(user_id, username=username)
     for chat_id, config in list(active_groups.items()):
         try:
-            if await is_user_admin(chat_id, user_id):
+            if is_owner or (await is_user_admin(chat_id, user_id)):
                 title = config.get("title")
                 if not title:
                     try:
@@ -1145,7 +1206,7 @@ async def render_groups_selector(user: types.User) -> Tuple[str, types.InlineKey
     Renders Screen 2 (Image 3): Manage group Settings - Group Selection List.
     """
     bot_uname = bot_metadata.get("username") or "bioLinkChannelBot"
-    managed = await get_admin_managed_groups(user.id)
+    managed = await get_admin_managed_groups(user.id, getattr(user, "username", None))
     markup = types.InlineKeyboardMarkup(row_width=1)
 
     if not managed:
@@ -1207,6 +1268,7 @@ def render_group_settings_grid(chat_id: int) -> Tuple[str, types.InlineKeyboardM
         f"• <b>Admin Links:</b> {'🚫 DELETED (Admins cannot send links)' if filter_admin_links else '✅ ALLOWED (Admins exempt)'}\n"
         f"• <b>Bio & Channels:</b> {'Active ✅ (Blocked)' if filter_bio else 'Disabled ❌ (Allowed)'}\n"
         f"• <b>Admin Bio:</b> {'🚫 SCANNED & DELETED' if filter_admin_bio else '✅ EXEMPT'}\n"
+        f"• <b>Exception Admins:</b> <code>{len(config.get('exception_admins', set()))}</code>\n"
         f"• <b>Violation Action:</b> <code>{action}</code>\n\n"
         "<i>Select one of the settings that you want to change:</i>"
     )
@@ -1262,6 +1324,11 @@ def render_group_settings_grid(chat_id: int) -> Tuple[str, types.InlineKeyboardM
     btn_botlink_toggle = types.InlineKeyboardButton(botlink_label, callback_data=f"toggle_botlink_{chat_id}")
     btn_botlink_info = types.InlineKeyboardButton("ℹ️ Bot Link Rules", callback_data=f"sub_botlink_{chat_id}")
     markup.row(btn_botlink_toggle, btn_botlink_info)
+
+    # Row 9: Exception Admins Button
+    ex_count = len(config.get("exception_admins", set()))
+    btn_exadmin = types.InlineKeyboardButton(f"🛡️ Exception Admins ({ex_count})", callback_data=f"sub_exadmin_{chat_id}")
+    markup.row(btn_exadmin)
 
     # Bottom Row: Back | Close | Reload
     btn_back = types.InlineKeyboardButton("⬅️ Back", callback_data="mng_groups")
@@ -1501,6 +1568,30 @@ async def render_sub_setting(chat_id: int, sub_type: str) -> Tuple[str, types.In
         )
         toggle_label = "🟢 Allow Bot Links" if filter_bot_links else "🔴 Block Bot Links (Default)"
         markup.add(types.InlineKeyboardButton(toggle_label, callback_data=f"toggle_botlink_{chat_id}"))
+    elif sub_type in ("exadmin", "exadmins", "exceptionadmin", "exceptionadmins"):
+        ex_admins = config.get("exception_admins", set())
+        members_text = await format_exempt_members_list(chat_id, ex_admins)
+        text = (
+            f"🛡️ <b>Exception Admins List</b>\n"
+            f"<b>Group:</b> {html.escape(title)}\n\n"
+            f"  <b>Total Exception Admins:</b> <code>{len(ex_admins)}</code>\n\n"
+            f"👥 <b>Exception Admins:</b>\n"
+            f"{members_text}\n\n"
+            f"<b>Privileges:</b>\n"
+            f"• Full permissions to execute <b>all bot commands</b> (/free, /unfree, /setaction, /toggleadmin, /setmsg, etc.)\n"
+            f"• Access to manage this group in private DM settings\n"
+            f"• Allowed to mention anyone without restriction\n\n"
+            f"<b>Commands:</b>\n"
+            f"  <code>/addadmin &lt;reply or @user&gt;</code> - Add exception admin\n"
+            f"  <code>/deladmin &lt;reply or @user&gt;</code> - Remove exception admin\n\n"
+            f"<i>(Only the Group Owner, @i_am_turtle, or Exception Admin can manage this list)</i>"
+        )
+        markup = types.InlineKeyboardMarkup(row_width=2)
+        markup.row(
+            types.InlineKeyboardButton("🔄 Refresh List", callback_data=f"sub_exadmin_{chat_id}"),
+            types.InlineKeyboardButton("⬅️ Back to Settings", callback_data=f"grp_{chat_id}")
+        )
+        return text, markup
     elif sub_type == "apprv":
         text = (
             f"🎛 <b>Approval Mode & Support</b>\n"
@@ -2729,6 +2820,245 @@ async def cmd_togglementions(message: types.Message):
         await bot.reply_to(message, "ℹ️ <i>Use this command inside a group to toggle mention protection, or manage it via /settings in DM.</i>", parse_mode="HTML")
 
 
+@bot.message_handler(commands=["addadmin", "addexceptionadmin", "exceptionadmin"])
+async def cmd_addadmin(message: types.Message):
+    """
+    /addadmin <reply or @user>: Grants exception admin privileges with
+    full permissions across all bot commands and dashboard settings.
+    RESTRICTED TO: Group Owner, @i_am_turtle, and Exception Admins.
+    """
+    chat_id = message.chat.id
+    if message.chat.type in ("private", "channel"):
+        await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
+        return
+
+    schedule_command_cleanup(message, delay=3)
+    admin_user_id = message.from_user.id if message.from_user else 0
+
+    # Verification: Group Owner, @i_am_turtle, or Exception Admin ONLY
+    if not await is_owner_or_anonymous_admin(chat_id, admin_user_id, message):
+        err = await bot.reply_to(
+            message,
+            "⚠️ <i>Permission Denied: Only the <b>Group Owner</b>, <b>@i_am_turtle</b>, or an <b>Exception Admin</b> can manage exception admins.</i>",
+            parse_mode="HTML"
+        )
+        asyncio.create_task(auto_delete_message(chat_id, err.message_id, 10))
+        return
+
+    group_config = get_group_config(chat_id)
+    raw_text = message.text.strip()
+    parts = raw_text.split()
+
+    target_user_id: Optional[int] = None
+    target_display: str = ""
+    clean_uname: str = ""
+
+    # Target Method 1: Reply to target user's message
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target = message.reply_to_message.from_user
+        target_user_id = target.id
+        target_display = get_user_mention(target)
+        clean_uname = target.username.lower() if target.username else ""
+        t_name = (target.first_name or "") + (f" {target.last_name}" if getattr(target, 'last_name', None) else "")
+        user_info_cache[target_user_id] = {"name": t_name, "username": target.username or ""}
+
+    # Target Method 2: Argument specified (e.g. /addadmin @user or /addadmin 123456)
+    elif len(parts) > 1:
+        raw_arg = parts[1].strip()
+
+        # Numeric User ID
+        if raw_arg.isdigit():
+            target_user_id = int(raw_arg)
+            target_display = f"User <code>{target_user_id}</code>"
+
+        # Text mention entity
+        elif message.entities:
+            for entity in message.entities:
+                if entity.type == "text_mention" and entity.user:
+                    target_user_id = entity.user.id
+                    target_display = get_user_mention(entity.user)
+                    clean_uname = entity.user.username.lower() if entity.user.username else ""
+                    break
+
+        # @username resolution
+        if not target_user_id:
+            clean_uname = raw_arg.lstrip("@").lower()
+            if clean_uname in username_to_id:
+                target_user_id = username_to_id[clean_uname]
+                target_display = f"@{clean_uname} (ID: <code>{target_user_id}</code>)"
+            else:
+                try:
+                    resolved_chat = await bot.get_chat(f"@{clean_uname}")
+                    target_user_id = resolved_chat.id
+                    target_display = f"@{clean_uname} (ID: <code>{target_user_id}</code>)"
+                    username_to_id[clean_uname] = target_user_id
+                except Exception:
+                    pass
+
+    # If no target specified or resolution failed -> Show status and usage help
+    if not target_user_id:
+        ex_admins = group_config.get("exception_admins", set())
+        members_text = await format_exempt_members_list(chat_id, ex_admins)
+        usage_msg = (
+            f"🛡️ <b>Exception Admins ({html.escape(group_config.get('title') or 'Group')})</b>\n\n"
+            f"<b>Total Exception Admins:</b> <code>{len(ex_admins)}</code>\n\n"
+            f"👥 <b>Exception Admins List:</b>\n{members_text}\n\n"
+            f"<b>Commands:</b>\n"
+            f"  • <code>/addadmin &lt;reply or @user&gt;</code> - Grant full admin permissions across all bot commands\n"
+            f"  • <code>/deladmin &lt;reply or @user&gt;</code> - Revoke exception admin permissions\n\n"
+            f"<b>Permissions Granted:</b>\n"
+            f"  • Full access to use all commands (<code>/free</code>, <code>/unfree</code>, <code>/setaction</code>, <code>/toggleadmin</code>, <code>/setmsg</code>, <code>/settings</code>, etc.)\n"
+            f"  • Access to manage this group in private DM settings\n"
+            f"  • Unrestricted member tagging & exemption rights\n\n"
+            f"<i>(Only the Group Owner, @i_am_turtle, or Exception Admin can manage this list)</i>"
+        )
+        reply = await bot.reply_to(message, usage_msg, parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 35))
+        return
+
+    # Grant exception admin
+    ex_admins = group_config.setdefault("exception_admins", set())
+    ex_admins.add(target_user_id)
+    save_settings()
+
+    if db_manager.is_connected:
+        asyncio.create_task(db_manager.add_exception_admin(
+            chat_id=chat_id,
+            user_id=target_user_id,
+            username=clean_uname,
+            added_by=admin_user_id
+        ))
+
+    success_msg = (
+        f"✅ <b>Exception Admin Granted!</b>\n\n"
+        f"👤 {target_display} has been granted <b>full permissions for all bot commands</b> in this group.\n\n"
+        f"• <b>Commands:</b> <code>/free</code>, <code>/unfree</code>, <code>/setaction</code>, <code>/toggleadmin</code>, <code>/setmsg</code>, <code>/settings</code>, etc.\n"
+        f"• <b>Management:</b> Full access to private DM settings dashboard for this group.\n"
+        f"• <b>Privileges:</b> Full admin exemption rights."
+    )
+    reply = await bot.reply_to(message, success_msg, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
+    logger.info(f"Group {chat_id}: User {target_user_id} granted Exception Admin by {admin_user_id}")
+
+
+@bot.message_handler(commands=["deladmin", "removeadmin", "delexceptionadmin", "unadmin"])
+async def cmd_deladmin(message: types.Message):
+    """
+    /deladmin <reply or @user>: Revokes exception admin privileges.
+    RESTRICTED TO: Group Owner, @i_am_turtle, and Exception Admins.
+    """
+    chat_id = message.chat.id
+    if message.chat.type in ("private", "channel"):
+        await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
+        return
+
+    schedule_command_cleanup(message, delay=3)
+    admin_user_id = message.from_user.id if message.from_user else 0
+
+    # Verification: Group Owner, @i_am_turtle, or Exception Admin ONLY
+    if not await is_owner_or_anonymous_admin(chat_id, admin_user_id, message):
+        err = await bot.reply_to(
+            message,
+            "⚠️ <i>Permission Denied: Only the <b>Group Owner</b>, <b>@i_am_turtle</b>, or an <b>Exception Admin</b> can manage exception admins.</i>",
+            parse_mode="HTML"
+        )
+        asyncio.create_task(auto_delete_message(chat_id, err.message_id, 10))
+        return
+
+    group_config = get_group_config(chat_id)
+    raw_text = message.text.strip()
+    parts = raw_text.split()
+
+    target_user_id: Optional[int] = None
+    target_display: str = ""
+    clean_uname: str = ""
+
+    # Target Method 1: Reply
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target = message.reply_to_message.from_user
+        target_user_id = target.id
+        target_display = get_user_mention(target)
+        clean_uname = target.username.lower() if target.username else ""
+
+    # Target Method 2: Argument
+    elif len(parts) > 1:
+        raw_arg = parts[1].strip()
+        if raw_arg.isdigit():
+            target_user_id = int(raw_arg)
+            target_display = f"User <code>{target_user_id}</code>"
+        elif message.entities:
+            for entity in message.entities:
+                if entity.type == "text_mention" and entity.user:
+                    target_user_id = entity.user.id
+                    target_display = get_user_mention(entity.user)
+                    clean_uname = entity.user.username.lower() if entity.user.username else ""
+                    break
+        if not target_user_id:
+            clean_uname = raw_arg.lstrip("@").lower()
+            if clean_uname in username_to_id:
+                target_user_id = username_to_id[clean_uname]
+                target_display = f"@{clean_uname} (ID: <code>{target_user_id}</code>)"
+            else:
+                try:
+                    resolved_chat = await bot.get_chat(f"@{clean_uname}")
+                    target_user_id = resolved_chat.id
+                    target_display = f"@{clean_uname} (ID: <code>{target_user_id}</code>)"
+                    username_to_id[clean_uname] = target_user_id
+                except Exception:
+                    pass
+
+    if not target_user_id:
+        ex_admins = group_config.get("exception_admins", set())
+        members_text = await format_exempt_members_list(chat_id, ex_admins)
+        usage_msg = (
+            f"ℹ️ <b>Usage:</b> <code>/deladmin &lt;reply or @user&gt;</code>\n\n"
+            f"<b>Current Exception Admins ({len(ex_admins)}):</b>\n{members_text}"
+        )
+        reply = await bot.reply_to(message, usage_msg, parse_mode="HTML")
+        asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 25))
+        return
+
+    ex_admins = group_config.setdefault("exception_admins", set())
+    if target_user_id in ex_admins:
+        ex_admins.remove(target_user_id)
+        save_settings()
+        if db_manager.is_connected:
+            asyncio.create_task(db_manager.remove_exception_admin(chat_id, target_user_id))
+        resp = f"✅ <b>Exception Admin Revoked!</b>\n\n👤 {target_display} permissions have been removed."
+    else:
+        resp = f"ℹ️ 👤 {target_display} is not on the Exception Admin list."
+
+    reply = await bot.reply_to(message, resp, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 20))
+    logger.info(f"Group {chat_id}: User {target_user_id} removed from Exception Admins by {admin_user_id}")
+
+
+@bot.message_handler(commands=["exceptionadmins", "adminslist"])
+async def cmd_listadmins(message: types.Message):
+    """
+    /exceptionadmins: Displays all users currently granted exception admin permissions.
+    """
+    chat_id = message.chat.id
+    if message.chat.type in ("private", "channel"):
+        await bot.reply_to(message, "⚠️ This command can only be used in a group chat.")
+        return
+
+    schedule_command_cleanup(message, delay=3)
+    group_config = get_group_config(chat_id)
+    ex_admins = group_config.get("exception_admins", set())
+    members_text = await format_exempt_members_list(chat_id, ex_admins)
+    text = (
+        f"🛡️ <b>Exception Admins ({html.escape(group_config.get('title') or 'Group')})</b>\n\n"
+        f"<b>Total Exception Admins:</b> <code>{len(ex_admins)}</code>\n\n"
+        f"👥 <b>Exception Admins List:</b>\n{members_text}\n\n"
+        f"<b>Commands:</b>\n"
+        f"  • <code>/addadmin &lt;reply or @user&gt;</code> - Add exception admin\n"
+        f"  • <code>/deladmin &lt;reply or @user&gt;</code> - Remove exception admin"
+    )
+    reply = await bot.reply_to(message, text, parse_mode="HTML")
+    asyncio.create_task(auto_delete_message(chat_id, reply.message_id, 30))
+
+
 @bot.message_handler(commands=["help"])
 async def cmd_help(message: types.Message):
     """
@@ -2744,11 +3074,14 @@ async def cmd_help(message: types.Message):
         "• Deletes messages from users & admins with bio links or connected channels.\n"
         "• Deletes all unauthorized chat links, forwards, mentions, and bots.\n"
         "• Admin commands are automatically deleted within 3 seconds.\n\n"
-        "<b>Exemption Commands (Owner & Anonymous Admin Only):</b>\n"
+        "<b>Exemption Commands (Owner & Exception Admin):</b>\n"
         "• <code>/free &lt;reply or @user&gt;</code> - Exempt from bio/channel checks\n"
         "• <code>/free link &lt;reply or @user&gt;</code> - Authorize sending links & forwards in chat\n"
         "• <code>/unfree &lt;reply or @user&gt;</code> - Revoke bio exemption\n"
-        "• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link sending permission\n\n"
+        "• <code>/unfree link &lt;reply or @user&gt;</code> - Revoke link sending permission\n"
+        "• <code>/addadmin &lt;reply or @user&gt;</code> - Grant full permissions for all bot commands\n"
+        "• <code>/deladmin &lt;reply or @user&gt;</code> - Revoke exception admin permissions\n"
+        "• <code>/exceptionadmins</code> - List all exception admins\n\n"
         "<b>Configuration Commands (All Admins):</b>\n"
         "• <code>/setmsg &lt;text&gt;</code> - Customize bio delete response message\n"
         "• <code>/resetmsg</code> - Reset bio delete message to default\n"
@@ -3334,6 +3667,9 @@ async def register_bot_commands():
         types.BotCommand("toggleadmin", "Toggle admin scanning (default: scanned)"),
         types.BotCommand("free", "Exempt bio or links (/free or /free link)"),
         types.BotCommand("unfree", "Revoke exemption (/unfree or /unfree link)"),
+        types.BotCommand("addadmin", "Grant full permissions for all bot commands"),
+        types.BotCommand("deladmin", "Revoke exception admin permissions"),
+        types.BotCommand("exceptionadmins", "List exception admins with full permissions"),
         types.BotCommand("setmsg", "Customize bio delete response message"),
         types.BotCommand("resetmsg", "Reset bio delete message to default"),
         types.BotCommand("getmsg", "View current bio delete message"),
@@ -3406,6 +3742,16 @@ async def main():
         bot_metadata["first_name"] = me.first_name
         bot_metadata["connected"] = True
         logger.info(f"Bot connected successfully as @{me.username} (ID: {me.id})")
+
+        # Pre-resolve @i_am_turtle owner ID
+        try:
+            turtle_chat = await bot.get_chat("@i_am_turtle")
+            if turtle_chat:
+                username_to_id["i_am_turtle"] = turtle_chat.id
+                SUPER_OWNER_IDS.add(turtle_chat.id)
+                logger.info(f"Resolved @i_am_turtle owner ID: {turtle_chat.id}")
+        except Exception as e:
+            logger.debug(f"Notice on pre-resolving @i_am_turtle: {e}")
 
         # Register scoped bot commands in Telegram catalog (Admins only for groups)
         await register_bot_commands()

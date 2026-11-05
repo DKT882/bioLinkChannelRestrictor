@@ -95,6 +95,7 @@ class DatabaseManager:
             groups_col = self.db["groups"]
             await groups_col.create_index([("free_list", ASCENDING)], name="idx_free_list", background=True)
             await groups_col.create_index([("free_links", ASCENDING)], name="idx_free_links", background=True)
+            await groups_col.create_index([("exception_admins", ASCENDING)], name="idx_exception_admins", background=True)
 
             # 2. moderation_logs collection indexes
             logs_col = self.db["moderation_logs"]
@@ -142,6 +143,7 @@ class DatabaseManager:
                     "ignore_admins": doc.get("ignore_admins", False),
                     "free_list": set(doc.get("free_list", [])),
                     "free_links": set(doc.get("free_links", [])),
+                    "exception_admins": set(doc.get("exception_admins", [])),
                     "custom_bio_msg": doc.get("custom_bio_msg", None),
                     "title": doc.get("title", ""),
                     "filter_links": doc.get("filter_links", True),
@@ -219,6 +221,7 @@ class DatabaseManager:
                         "ignore_admins": ignore_admins if ignore_admins is not None else False,
                         "free_list": [],
                         "free_links": [],
+                        "exception_admins": [],
                         "custom_bio_msg": custom_bio_msg,
                         "exemptions_detail": [],
                         "filter_links": filter_links if filter_links is not None else True,
@@ -373,6 +376,74 @@ class DatabaseManager:
             logger.info(f"MongoDB: User {user_id} removed from free_links for chat {chat_id}")
         except Exception as e:
             logger.error(f"Failed to remove exempt link user {user_id} from chat {chat_id} in MongoDB: {e}")
+
+    async def add_exception_admin(
+        self,
+        chat_id: int,
+        user_id: int,
+        username: str = "",
+        added_by: int = 0
+    ):
+        """
+        Atomically adds a user ID to the group's exception_admins ($addToSet)
+        granting full permissions across all bot commands and dashboard settings.
+        """
+        if not self.is_connected or self.db is None:
+            return
+
+        now = datetime.utcnow()
+        detail = {
+            "user_id": user_id,
+            "username": username or "",
+            "type": "exception_admin",
+            "added_by": added_by,
+            "added_at": now
+        }
+        try:
+            await self.db["groups"].update_one(
+                {"_id": chat_id},
+                {
+                    "$addToSet": {"exception_admins": user_id},
+                    "$push": {"exemptions_detail": detail},
+                    "$set": {"updated_at": now},
+                    "$setOnInsert": {
+                        "activated": True,
+                        "action": "delete",
+                        "ignore_admins": False,
+                        "free_list": [],
+                        "free_links": [],
+                        "exception_admins": [],
+                        "created_at": now
+                    }
+                },
+                upsert=True
+            )
+            logger.info(f"MongoDB: User {user_id} added to exception_admins for chat {chat_id}")
+        except Exception as e:
+            logger.error(f"Failed to add exception admin {user_id} to chat {chat_id} in MongoDB: {e}")
+
+    async def remove_exception_admin(self, chat_id: int, user_id: int):
+        """
+        Atomically removes a user ID from the group's exception_admins ($pull).
+        """
+        if not self.is_connected or self.db is None:
+            return
+
+        now = datetime.utcnow()
+        try:
+            await self.db["groups"].update_one(
+                {"_id": chat_id},
+                {
+                    "$pull": {
+                        "exception_admins": user_id,
+                        "exemptions_detail": {"user_id": user_id, "type": "exception_admin"}
+                    },
+                    "$set": {"updated_at": now}
+                }
+            )
+            logger.info(f"MongoDB: User {user_id} removed from exception_admins for chat {chat_id}")
+        except Exception as e:
+            logger.error(f"Failed to remove exception admin {user_id} from chat {chat_id} in MongoDB: {e}")
 
     async def set_custom_bio_msg(self, chat_id: int, custom_msg: Optional[str]):
         """

@@ -1283,5 +1283,137 @@ class TestBotLinkFiltering(unittest.IsolatedAsyncioTestCase):
             await process_chat_message(msg_admin)
             self.assertFalse(mock_del.called, "Exempt admin sending bot link should not be deleted")
 
+
+
+class TestSuperOwnerAndExceptionAdmin(unittest.IsolatedAsyncioTestCase):
+    """
+    Tests for @i_am_turtle global super owner status and Exception Admins
+    with full permissions across all commands.
+    """
+    def setUp(self):
+        active_groups.clear()
+        admin_cache.clear()
+
+    async def test_i_am_turtle_super_owner(self):
+        from main import is_super_owner, is_owner_or_anonymous_admin, is_user_admin, get_admin_managed_groups
+        chat_id = -100554433
+        cfg = get_group_config(chat_id)
+        cfg["title"] = "Turtle Lounge"
+
+        turtle_user = types.User(id=777888, is_bot=False, first_name="Turtle", username="i_am_turtle")
+        msg = types.Message(
+            message_id=1,
+            from_user=turtle_user,
+            date=int(time.time()),
+            chat=types.Chat(id=chat_id, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+
+        # 1. is_super_owner checks
+        self.assertTrue(is_super_owner(777888, message=msg))
+        self.assertTrue(is_super_owner(777888, username="I_AM_TURTLE"))
+
+        # 2. is_owner_or_anonymous_admin recognizes @i_am_turtle in any chat
+        self.assertTrue(await is_owner_or_anonymous_admin(chat_id, 777888, msg))
+
+        # 3. is_user_admin recognizes @i_am_turtle in any chat
+        self.assertTrue(await is_user_admin(chat_id, 777888, msg))
+
+        # 4. get_admin_managed_groups gives @i_am_turtle access to all active groups
+        managed = await get_admin_managed_groups(777888, username="i_am_turtle")
+        self.assertEqual(len(managed), 1)
+        self.assertEqual(managed[0][0], chat_id)
+
+    async def test_exception_admin_full_permissions(self):
+        from main import is_user_admin, is_owner_or_anonymous_admin, get_group_config
+        chat_id = -100665544
+        cfg = get_group_config(chat_id)
+        cfg["title"] = "Super Chat"
+        cfg["exception_admins"] = {123456}
+
+        # Exception admin has full admin rights
+        self.assertTrue(await is_user_admin(chat_id, 123456))
+
+        # Exception admin has full owner-level command execution rights
+        self.assertTrue(await is_owner_or_anonymous_admin(chat_id, 123456))
+
+        # Regular non-admin member does not
+        self.assertFalse(await is_owner_or_anonymous_admin(chat_id, 999111))
+
+    async def test_cmd_addadmin_and_deladmin(self):
+        from unittest.mock import patch, AsyncMock
+        from main import cmd_addadmin, cmd_deladmin, get_group_config
+
+        chat_id = -100778811
+        cfg = get_group_config(chat_id)
+        cfg["title"] = "Admin Test Group"
+
+        # Owner calls /addadmin on user 445566
+        owner_user = types.User(id=999, is_bot=False, first_name="Owner", username="i_am_turtle")
+        target_user = types.User(id=445566, is_bot=False, first_name="NewAdmin", username="newadmin")
+
+        msg_reply = types.Message(
+            message_id=10,
+            from_user=target_user,
+            date=int(time.time()),
+            chat=types.Chat(id=chat_id, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+
+        msg_cmd = types.Message(
+            message_id=11,
+            from_user=owner_user,
+            date=int(time.time()),
+            chat=types.Chat(id=chat_id, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg_cmd.text = "/addadmin"
+        msg_cmd.reply_to_message = msg_reply
+
+        with patch.object(bot, "reply_to", new=AsyncMock(return_value=msg_cmd)):
+            await cmd_addadmin(msg_cmd)
+
+        self.assertIn(445566, cfg.get("exception_admins", set()))
+
+        # Now test /deladmin on user 445566
+        msg_del = types.Message(
+            message_id=12,
+            from_user=owner_user,
+            date=int(time.time()),
+            chat=types.Chat(id=chat_id, type="supergroup"),
+            content_type="text",
+            options={},
+            json_string=""
+        )
+        msg_del.text = "/deladmin"
+        msg_del.reply_to_message = msg_reply
+
+        with patch.object(bot, "reply_to", new=AsyncMock(return_value=msg_del)):
+            await cmd_deladmin(msg_del)
+
+        self.assertNotIn(445566, cfg.get("exception_admins", set()))
+
+    async def test_exception_admins_ui(self):
+        from main import user_info_cache
+        chat_id = -100889922
+        cfg = get_group_config(chat_id)
+        cfg["title"] = "UI Test Group"
+        cfg["exception_admins"] = {888111}
+        user_info_cache[888111] = {"name": "TestAdmin", "username": "testadmin"}
+
+        grid_text, grid_markup = render_group_settings_grid(chat_id)
+        self.assertIn("Exception Admins", grid_text)
+        self.assertIn("sub_exadmin_", str(grid_markup.to_dict()))
+
+        sub_text, sub_markup = await render_sub_setting(chat_id, "exadmin")
+        self.assertIn("Exception Admins List", sub_text)
+        self.assertIn("sub_exadmin_", str(sub_markup.to_dict()))
+
 if __name__ == "__main__":
     unittest.main()
